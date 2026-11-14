@@ -53,6 +53,14 @@ DESKTOP_CLIENT_VERSION = '0.5.3'
 CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns'
 CLAIM_PATH = '/sash/api/v1/me/campaigns/%s/claim'
 REFRESH_PATH = '/api/v1/deviceToken/refresh'
+# 只读余额接口：拿「当前剩余额度」和「本周期结束日」。
+# 与 AiRoute 渠道包 channels/plugins/qoder/protocol.js 的 USAGE_PATH 完全一致。
+# ⚠️ 这个端点不需要 WASM 签名，只要 Bearer + 桌面端身份头。
+USAGE_PATH = '/sash/api/v2/me/usage'
+
+# save() 是全部出口的唯一汇聚点，余额查询在那里做；这里记录当前真正生效的令牌。
+# 只用内存变量，绝不写进 result.json / 日志。
+_ACTIVE_TOKEN = ''
 
 RESULT = {
     'account': LABEL,
@@ -65,15 +73,16 @@ RESULT = {
 }
 
 
-# ── 企业微信通知（与 WorkBuddy 签到同一套做法） ──────────────
+# ── 企业微信通知（与小浣熊 / WorkBuddy 同一套做法） ──────────
 # 只读 工具箱/配置.json 的 wecom 字段（4 段：corpid,corpsecret,touser,agentid）。
-# 云端跑时该文件不存在，改为读 QODER_WECOM_APP 环境变量（由 workflow 从 Secret 注入）。
+# 云端跑时该文件不存在，改为读 WECOM_APP 环境变量（由 workflow 从 Secret 注入，
+# 与「每日积分播报」共用同一个 Secret）。兼容旧的 QODER_WECOM_APP 名称。
 
 NOTIFY_FILE = os.environ.get('QODER_NOTIFY_FILE') or ''
 
 
 def _wecom_config():
-    raw = (os.environ.get('QODER_WECOM_APP') or '').strip()
+    raw = (os.environ.get('WECOM_APP') or os.environ.get('QODER_WECOM_APP') or '').strip()
     if not raw and NOTIFY_FILE:
         try:
             with open(NOTIFY_FILE, encoding='utf-8') as f:
@@ -301,8 +310,82 @@ def claim(token, cid):
     return 'failed', 0, str(body.get('message') or body.get('error') or ('HTTP %s' % status))[:120]
 
 
+def _num(v):
+    try:
+        return round(float(v or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _expiry_date_text(ms):
+    """毫秒时间戳 → (北京时间日期字符串, 剩余天数, 建议用掉日)。"""
+    try:
+        when = datetime.fromtimestamp(float(ms) / 1000.0, BEIJING)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return '', None, ''
+    today = datetime.now(BEIJING).date()
+    day = when.date()
+    days = (day - today).days
+    use_by = (day - timedelta(days=1)).isoformat()
+    return day.isoformat(), days, use_by
+
+
+def query_balance(token):
+    """只读查询余额与额度周期结束日，返回白名单结构。
+
+    与 AiRoute channels/plugins/qoder/protocol.js 的 parseUsageBalance 同口径：
+    总积分 = Σ 各 quota / 资源包的 remaining；周期结束日取 usage.expiresAt。
+    这里只做 GET 只读，绝不触发任何领取动作；任何异常都降级成 error 字段，
+    绝不影响签到主流程或退出码。
+    """
+    out = {}
+    if not token:
+        return {'error': '无可用访问令牌'}
+    try:
+        status, data, _text = request(
+            'GET', USAGE_PATH, token=token,
+            headers={'Cosy-ClientType': DESKTOP_CLIENT_TYPE})
+        if status != 200 or not isinstance(data, dict):
+            # 不回显响应正文（可能含用户资料），只报状态
+            return {'error': '余额接口 HTTP %s' % status}
+        usage = data.get('qoderUsage') or {}
+        if not isinstance(usage, dict):
+            return {'error': '余额响应缺少 qoderUsage'}
+        total = 0.0
+        for key in ('userQuota', 'addOnQuota'):
+            q = usage.get(key)
+            if isinstance(q, dict):
+                total += _num(q.get('remaining'))
+        for key in ('dedicatedResourcePackages', 'orgResourcePackages'):
+            for pkg in (usage.get(key) or []):
+                if isinstance(pkg, dict):
+                    total += _num(pkg.get('remaining'))
+        exp_ms = usage.get('expiresAt') or usage.get('refreshAt')
+        exp_date, days, use_by = _expiry_date_text(exp_ms)
+        out = {
+            'credits': total,
+            'earliest_remaining': total,
+            'label': '本周期额度到期',
+        }
+        if exp_date:
+            out.update({'earliest_expire_date': exp_date,
+                        'days_left': days, 'use_by': use_by})
+        else:
+            out['error'] = '未取到额度周期结束日'
+    except Exception as e:
+        return {'error': '查询异常 %s' % type(e).__name__}
+    return out
+
+
 def save(result):
     path = os.environ.get('QODER_RESULT_FILE') or 'result.json'
+    # ── 每日积分播报数据源 ──────────────────────────────────
+    # 放在唯一汇聚点，保证所有返回分支都带上余额；只读查询，失败只留 error 字段，
+    # 不影响签到结论、退出码与失败告警。汇总脚本会按账号逐个展示。
+    try:
+        result['expiry'] = query_balance(_ACTIVE_TOKEN)
+    except Exception as e:
+        result['expiry'] = {'error': '查询异常 %s' % type(e).__name__}
     # 失败才推送：成功/已领不打扰（与 WorkBuddy 的 SUCCESS_NOTIFY 默认关一致）
     if result.get('outcome') == 'failed':
         try:
@@ -318,6 +401,7 @@ def save(result):
 
 
 def main():
+    global _ACTIVE_TOKEN
     RESULT['account'] = LABEL
     RESULT['uid'] = UID
 
@@ -326,6 +410,7 @@ def main():
         log('[x] ' + RESULT['message'])
         return save(RESULT) or 1
     token = ACCESS_TOKEN
+    _ACTIVE_TOKEN = token
 
     # 没有 dt- 就直接续期
     if not token:
@@ -336,6 +421,7 @@ def main():
             log('[x] ' + err)
             return save(RESULT) or 1
         RESULT['refreshed'] = True
+        _ACTIVE_TOKEN = token
         note('已用续期令牌换取访问令牌')
 
     log('账号：%s  uid：%s  端点：%s' % (LABEL, UID or '(未填)', OPENAPI))
@@ -347,6 +433,7 @@ def main():
         newtok, _nr, rerr = refresh(REFRESH_TOKEN)
         if newtok:
             token = newtok
+            _ACTIVE_TOKEN = token
             RESULT['refreshed'] = True
             note('访问令牌已续期，重试活动列表')
             items, err, kind = load_campaigns(token)
