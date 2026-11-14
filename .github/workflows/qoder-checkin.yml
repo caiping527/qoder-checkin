@@ -93,7 +93,7 @@ jobs:
   checkin_main:
     name: 执行领取 · 主账号
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
 
       # ── 错峰等待（主账号）──────────────────────────
@@ -165,7 +165,7 @@ jobs:
     needs: prepare_accounts
     if: needs.prepare_accounts.outputs.count != '0'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       max-parallel: 1        # 串行：上游对连续 claim 有频率判据
@@ -174,11 +174,11 @@ jobs:
     steps:
 
       # ── 错峰等待（按账号序号递增）────────────────────────
-      # 第 1 个动态账号 480 秒（排在主账号 240 秒之后），每多一个加 240 秒。
-      # 配合 max-parallel: 1，账号之间真的隔开了。
+      # 主账号已等 240 秒，动态账号从 240 秒起、每个再加 120 秒。
+      # 120 秒是权衡：Qoder 对连续 claim 敏感，但等太久会超时。
       - name: 错峰等待（第 ${{ matrix.seq }} 个账号）
         run: |
-          W=$(( 480 + ${{ matrix.seq }} * 240 ))
+          W=$(( 240 + ${{ matrix.seq }} * 120 ))
           echo "等待 ${W} 秒后开始（主账号已在前面跑过）"
           sleep "$W"
       - uses: actions/checkout@v4
