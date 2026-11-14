@@ -223,6 +223,7 @@ jobs:
           echo "::error::${{ matrix.slot }} 领取未成功（退出码 ${{ steps.checkin.outputs.exit_code }}）"
           exit 1
 
+  # ── 心跳上报（自动心跳监测注入，勿删）──────────────────────
   heartbeat:
     name: 上报成功心跳
     needs: [prepare_accounts, checkin_main, checkin_dynamic]
