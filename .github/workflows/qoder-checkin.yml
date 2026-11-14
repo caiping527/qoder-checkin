@@ -129,7 +129,7 @@ jobs:
           QODER_REFRESH_TOKEN: ${{ secrets.QODER_REFRESH_TOKEN }}
           QODER_UID: ${{ secrets.QODER_UID }}
           QODER_MACHINE_ID: ${{ secrets.QODER_MACHINE_ID }}
-          QODER_WECOM_APP: ${{ secrets.QODER_WECOM_APP }}
+          WECOM_APP: ${{ secrets.WECOM_APP }}
           QODER_ACCOUNT_LABEL: ${{ vars.QODER_LABEL || 'Qoder 主账号' }}
           QODER_CHECK_ONLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.check_only) && '1' || '0' }}
         run: |
@@ -152,6 +152,17 @@ jobs:
         run: |
           echo "### Qoder 领取结果" >> "$GITHUB_STEP_SUMMARY"
           python summarize.py result.json >> "$GITHUB_STEP_SUMMARY"
+
+      # 每日积分播报数据源：把本账号的积分/到期日交给汇总 job。
+      # if: always() 保证签到失败时也上传（失败账号会在播报里明确标出）。
+      - name: 上传积分数据供跨账号播报
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder-expiry-main
+          path: result.json
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: 失败时终止任务
         if: ${{ steps.guard.outputs.skip != 'true' && steps.checkin.outcome != 'success' }}
@@ -210,7 +221,7 @@ jobs:
           QODER_REFRESH_TOKEN: ${{ secrets.QODER_REFRESH_TOKEN }}
           QODER_UID: ${{ secrets.QODER_UID }}
           QODER_MACHINE_ID: ${{ secrets.QODER_MACHINE_ID }}
-          QODER_WECOM_APP: ${{ secrets.QODER_WECOM_APP }}
+          WECOM_APP: ${{ secrets.WECOM_APP }}
           QODER_ACCOUNT_LABEL: ${{ matrix.slot }}
           QODER_CHECK_ONLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.check_only) && '1' || '0' }}
         run: |
@@ -231,11 +242,53 @@ jobs:
           echo "### Qoder 领取结果 · ${{ matrix.slot }}" >> "$GITHUB_STEP_SUMMARY"
           python summarize.py result.json >> "$GITHUB_STEP_SUMMARY"
 
+      - name: 上传积分数据供跨账号播报
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder-expiry-${{ matrix.slot }}
+          path: result.json
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: 失败时终止任务
         if: ${{ steps.guard.outputs.skip != 'true' && steps.checkin.outcome != 'success' }}
         run: |
           echo "::error::${{ matrix.slot }} 领取未成功（退出码 ${{ steps.checkin.outputs.exit_code }}）"
           exit 1
+
+  # ── 每日积分播报：签到完成后汇总所有账号，推一条到手机 ──────────
+  # 独立于 heartbeat：即使某个账号失败也照常播报（失败账号明确标出），
+  # 且播报失败不影响签到结果与心跳上报。RECOMMEND_NOTIFY=0 可整体关闭。
+  daily_report:
+    name: 每日积分播报
+    needs: [checkin_main, checkin_dynamic]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      WECOM_APP: ${{ secrets.WECOM_APP }}
+      RECOMMEND_NOTIFY: ${{ vars.RECOMMEND_NOTIFY }}
+      REPORT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 下载各账号积分数据
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: qoder-expiry-*
+          path: _report
+
+      - name: 汇总积分并推送每日播报
+        run: |
+          python daily_report.py _report --title Qoder | tee _daily.md
+          cat _daily.md >> "$GITHUB_STEP_SUMMARY"
 
   # ── 心跳上报（自动心跳监测注入，勿删）──────────────────────
   heartbeat:
