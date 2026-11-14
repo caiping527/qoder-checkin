@@ -22,18 +22,18 @@ Qoder 的活动窗口是 **今天 10:00 → 明天 10:00**（UTC+8）。
 
 两个点都留了余量，因为 GitHub 的 cron 会随机延迟 5~7.5 小时。
 
-## 怎么部署
+## 怎么部署 / 怎么维护
 
-本机工具在 `D:\GITHUB与Token路由\QODER签到更新\`：
+本机工具在 `D:\GITHUB与Token路由\QODER签到更新\`，只有一个入口：
 
 1. 在 AiRoute 里登录 Qoder 账号
-2. 双击 `同步全部账号.bat`
-   - 读 AiRoute 里的全部 Qoder 账号
-   - 第 1 个 → 仓库级 Secret
-   - 其余 → 各建一个 Environment `qoder-<编号>`
-   - 上传代码与 workflow
+2. 双击 `一键更新.bat`
+   - 读 AiRoute 里的全部 Qoder 账号，依次上传凭据
+   - 第 1 个 → 仓库级 Secret；其余 → 各建 Environment `qoder-<编号>`
+   - 代码与 workflow 逐字比对，一致就跳过，有改动才上传
+   - 触发一次云端自检
 
-日常维护双击 `一键更新.bat`（只刷凭据 + 触发云端自检）。
+首次部署和日常维护都是它 —— 缺什么补什么，幂等。
 
 ## 目录
 
