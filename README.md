@@ -38,10 +38,23 @@ Qoder 的活动窗口是 **今天 10:00 → 明天 10:00**（UTC+8）。
 ## 目录
 
 ```
-checkin.py                       签到逻辑
+checkin.py                       签到逻辑（含积分/额度到期只读查询）
 summarize.py                     运行摘要
+daily_report.py                  每日积分播报（汇总各账号，推企业微信）
 .github/workflows/qoder-checkin.yml
 ```
+
+## 每日积分播报
+
+每天签到完成后，`daily_report` job 汇总全部账号，推一条消息到手机，逐个列出
+「当前积分」「还有多久到期、该提前哪天用掉」，按最早到期日排序。与小浣熊同形态。
+
+- 数据来源：云端只读调 `/sash/api/v2/me/usage`，与 AiRoute 本地余额口径一致；
+  查不到只标注「未取到」，不影响签到结果与心跳。
+- 推送凭据：`WECOM_APP`，由「一键更新」从 工具箱\配置.json 的 `wecom` 自动写入 Secret。
+- 关闭：仓库 Variable `RECOMMEND_NOTIFY=0`。
+- Qoder 的 `expiresAt` 是**本周期额度到期/刷新日**，播报按此措辞如实标注，
+  不冒充小浣熊那种逐批积分作废。
 
 ## 环境变量（由 Secrets 注入）
 
