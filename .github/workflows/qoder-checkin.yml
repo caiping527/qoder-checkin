@@ -78,11 +78,11 @@ jobs:
             [ "${#t}" -ge 4 ] || continue
             [ "${#t}" -le 16 ] || continue
             [ -z "$items" ] || items="$items,"
-            items="$items{\"slot\":\"$t\",\"env\":\"qoder-$t\"}"
+            items="$items{\"slot\":\"$t\",\"env\":\"qoder-$t\",\"seq\":$n}"
             n=$((n + 1))
           done
           if [ "$n" -eq 0 ]; then
-            echo 'matrix={"include":[{"slot":"none","env":"none"}]}' >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[{"slot":"none","env":"none","seq":0}]}' >> "$GITHUB_OUTPUT"
           else
             echo "matrix={\"include\":[$items]}" >> "$GITHUB_OUTPUT"
           fi
@@ -95,6 +95,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+
+      # ── 错峰等待（主账号）──────────────────────────
+      # Qoder 对「短时间内连续领取」有频率判据，主账号先等 4 分钟。
+      - name: 错峰等待 240 秒
+        run: sleep 240
       - uses: actions/checkout@v4
 
       - name: 检查凭据
@@ -167,6 +172,15 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare_accounts.outputs.matrix) }}
     environment: ${{ matrix.env }}
     steps:
+
+      # ── 错峰等待（按账号序号递增）────────────────────────
+      # 第 1 个动态账号 480 秒（排在主账号 240 秒之后），每多一个加 240 秒。
+      # 配合 max-parallel: 1，账号之间真的隔开了。
+      - name: 错峰等待（第 ${{ matrix.seq }} 个账号）
+        run: |
+          W=$(( 480 + ${{ matrix.seq }} * 240 ))
+          echo "等待 ${W} 秒后开始（主账号已在前面跑过）"
+          sleep "$W"
       - uses: actions/checkout@v4
 
       - name: 检查凭据
