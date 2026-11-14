@@ -64,7 +64,7 @@ daily_report.py                  每日积分播报（汇总各账号，推企�
 | `QODER_REFRESH_TOKEN` | `drt-` 续期令牌，可自动续期 |
 | `QODER_UID` | 账号 uid |
 | `QODER_MACHINE_ID` | 设备标识（续期用） |
-| `QODER_WECOM_APP` | 企业微信应用凭据 `corpid,corpsecret,touser,agentid` |
+| `WECOM_APP` | 企业微信应用凭据 `corpid,corpsecret,touser,agentid` |
 
 ## 多账号
 
