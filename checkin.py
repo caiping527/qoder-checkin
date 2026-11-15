@@ -466,7 +466,7 @@ def main():
     if not claimable:
         # Qoder 的领取窗口是「今天 10:00 → 明天 10:00」。在北京时间 10:00 之前跑，
         # 看到的仍是「昨天那轮」的状态：昨天已领 → 这里全变成 CLAIMED。
-        # 6 点那一班就是这种情况，用退出码 10 告诉 workflow「还没到点，等补签」，
+        # 8 点那一班就是这种情况，用退出码 10 告诉 workflow「还没到点，等补签」，
         # 不能报成「今天已领过」，否则补签那一班会误以为已经完成。
         now_bj = datetime.now(BEIJING)
         if now_bj.hour < 10:
