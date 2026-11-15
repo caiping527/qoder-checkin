@@ -104,15 +104,23 @@ def api_post(path, payload):
 
 
 def runs_today(event):
-    """今天主 workflow 的指定事件 run 列表。用 workflow 文件名过滤，
-    避免把 watchdog 自己的 schedule run 算进来。"""
-    q = urllib.parse.urlencode({
-        'created': datetime.now(BJ).date().isoformat(),
-        'event': event,
-        'per_page': '100',
-    })
+    """今天（北京时间）主 workflow 的指定事件 run 列表。
+
+    ⚠️ 不能用 API 的 created=YYYY-MM-DD 过滤：GitHub 按 UTC 日期算，
+    而主班 cron 是 UTC 23:00（= 北京次日 07:00），UTC 日期比北京早一天，
+    会被漏掉 → 巡检会误判「主班没落地」并天天走 15:00 兜底。
+    所以拉最近 100 条，在客户端按北京时间日期过滤。
+    用 workflow 文件名查询，避免把 watchdog 自己的 schedule run 算进来。
+    """
+    q = urllib.parse.urlencode({'event': event, 'per_page': '100'})
     d = api_get('/repos/%s/actions/workflows/%s/runs?%s' % (REPO, MAIN_WF, q))
-    return d.get('workflow_runs') or []
+    today = datetime.now(BJ).date()
+    out = []
+    for r in d.get('workflow_runs') or []:
+        c = to_bj(r.get('created_at'))
+        if c and c.date() == today:
+            out.append(r)
+    return out
 
 
 # ── 企业微信推送（自包含，和 daily_report / checkin 同一套凭据口径） ──
