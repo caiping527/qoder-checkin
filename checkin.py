@@ -40,7 +40,7 @@ TIMEOUT = 25
 
 # 退出码约定：
 #   0  = 领到了 / 今天已领过 / 确实没有活动
-#   10 = 窗口还没开（北京时间 10:00 前），这次不算失败（无补签班，当天会漏领）
+#   10 = 窗口还没开（北京时间 10:00 前），不算失败、不推手机，交给状态巡检补跑
 #   1  = 真失败（凭据被拒、网络、上游异常）
 EXIT_WINDOW_CLOSED = 10
 
@@ -466,7 +466,7 @@ def main():
     if not claimable:
         # Qoder 的领取窗口是「今天 10:00 → 明天 10:00」。在北京时间 10:00 之前跑，
         # 看到的仍是「昨天那轮」的状态：昨天已领 → 这里全变成 CLAIMED。
-        # 8 点那一班几乎不延迟时就是这种情况，用退出码 10 告诉 workflow「还没到点」，
+        # 7 点那一班几乎不延迟时就是这种情况，用退出码 10 告诉 workflow「还没到点」，
         # 不能报成「今天已领过」——那会把「没领到」伪装成「已完成」。
         now_bj = datetime.now(BEIJING)
         if now_bj.hour < 10:
@@ -474,7 +474,7 @@ def main():
             RESULT['window_closed'] = True
             RESULT['message'] = (
                 '当前北京时间 %s，今天 10:00 的新一轮还没开放（看到的是昨天那轮）。'
-                '已无补签班，今天不会自动补领；10 点后手动 Run workflow 可补领。'
+                '状态巡检会在 10:05 起接手，确认没领到时自动补跑。'
                 % now_bj.strftime('%H:%M')
             )
             log('[=] ' + RESULT['message'])
@@ -517,10 +517,13 @@ def main():
         log('[OK] ' + RESULT['message'])
         return save(RESULT) or 0
 
-    RESULT['outcome'] = 'ineligible'
+    # 有可领活动却一个都没领到：过了 10 点、也不是窗口问题，就是真异常
+    # （库存/风控/上游异常）。旧版归 ineligible + 退出 0，既不推手机也不让
+    # Actions 变红，巡检就无从判断「主班失败了」。这里改判 failed。
+    RESULT['outcome'] = 'failed'
     RESULT['message'] = '没有领到（可领活动均未成功，见上方详细结果）'
-    log('[=] ' + RESULT['message'])
-    return save(RESULT) or 0
+    log('[x] ' + RESULT['message'])
+    return save(RESULT) or 1
 
 
 if __name__ == '__main__':
