@@ -29,16 +29,17 @@ on:
   schedule:
     # GitHub Actions 的 cron 用 UTC。Qoder 领取窗口 =「今天 10:00 → 明天 10:00」。
     #
-    # 主跑：北京 06:07（= UTC 22:07 前一天）
-    #   6 点准点跑时窗口还没开，脚本会明确报「新一轮未开放」并以特殊退出码结束（10），
-    #   不会误报成「今天已领过」。
+    # 主跑：北京 08:00（= UTC 00:00）
+    #   8 点准点跑时窗口还没开，脚本会明确报「新一轮未开放」并以特殊退出码结束（10），
+    #   不会误报成「今天已领过」。GitHub cron 常延迟 3~7 小时，落点大概率进窗口内，
+    #   届时这一班就会真正领取；没进窗口就由下面 12:37 那班兜底。
     #
     # 补签：北京 12:37（= UTC 04:37）
     #   这是「10 点前跑过就补一次」的那一班。脚本自己判断：
     #     · 若今天还没领到 → 正常领取
     #     · 若今天已领到   → 直接报「今天已领过」，不做多余请求
     #   所以固定挂在这个点即可，无需额外状态文件。
-    - cron: '7 22 * * *'
+    - cron: '0 0 * * *'
     - cron: '37 4 * * *'
   workflow_dispatch:
     inputs:
@@ -96,10 +97,8 @@ jobs:
     timeout-minutes: 15
     steps:
 
-      # ── 错峰等待（主账号）──────────────────────────
-      # Qoder 对「短时间内连续领取」有频率判据，主账号先等 4 分钟。
-      - name: 错峰等待 240 秒
-        run: sleep 240
+      # 主账号先领、不额外等待；第二个号由 checkin_dynamic 的
+      # needs: checkin_main + sleep 300 保证在它之后整 5 分钟才 claim。
       - uses: actions/checkout@v4
 
       - name: 检查凭据
@@ -173,8 +172,8 @@ jobs:
   # ── 动态账号（Environment 级 Secret） ─────────────────────
   checkin_dynamic:
     name: 执行领取 · ${{ matrix.slot }}
-    needs: prepare_accounts
-    if: needs.prepare_accounts.outputs.count != '0'
+    needs: [prepare_accounts, checkin_main]
+    if: ${{ !cancelled() && needs.prepare_accounts.outputs.count != '0' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -184,14 +183,13 @@ jobs:
     environment: ${{ matrix.env }}
     steps:
 
-      # ── 错峰等待（固定 120 秒）──────────────────────────
-      # 串行本身就让账号一个接一个 claim，这里固定等 120 秒，
-      # 让相邻两次 claim 之间留出空隙（Qoder 对连续 claim 有频率判据）。
-      # 不用递增：会和串行叠加，第 4 个账号要等 10 分钟，必然超时。
-      - name: 错峰等待 120 秒
+      # ── 账号间隔 5 分钟 ──────────────────────────────────
+      # needs: checkin_main 保证本 job 一定在主账号之后启动；这里再等 300 秒，
+      # 使两次 claim 之间约 5 分钟（多账号时 max-parallel:1 依次递推）。
+      - name: 账号间隔 300 秒
         run: |
-          echo "等待 120 秒，避开前一个账号的 claim"
-          sleep 120
+          echo "等待 300 秒，与上一个账号的 claim 拉开 5 分钟"
+          sleep 300
       - uses: actions/checkout@v4
 
       - name: 检查凭据
