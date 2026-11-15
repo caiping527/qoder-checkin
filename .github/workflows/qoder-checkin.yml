@@ -29,12 +29,13 @@ on:
   schedule:
     # GitHub Actions 的 cron 用 UTC。Qoder 领取窗口 =「今天 10:00 → 明天 10:00」。
     #
-    # 唯一一班：北京 08:00（= UTC 00:00）
-    #   GitHub cron 常延迟 3~7 小时，落点大概率在 10:00 之后，届时直接领取。
-    #   ⚠️ 若某天几乎没延迟、8 点准点跑，窗口还没开：脚本报「新一轮未开放」
-    #      并退出 10，Actions 显示绿色、心跳照常上报 —— 当天就没人补领了。
-    #      要绝对不漏签，把这一班的 cron 直接设到 10:00 之后。
-    - cron: '0 0 * * *'
+    # 主班：北京 07:00（= UTC 23:00 前一天）
+    #   GitHub cron 常延迟 3~7.5 小时，落点大概率在 10:00 之后，届时直接领取。
+    #   若几乎没延迟、7 点准点跑，窗口还没开：脚本报「新一轮未开放」并退出 10，
+    #   Actions 显示绿色、不推手机，由 qoder-watchdog.yml 在 10:05 起每 15 分钟
+    #   只读巡检、确认主班跑完仍没领到时再 dispatch 本 workflow 补跑。
+    #   ⚠️ 巡检不直接 claim，靠本 workflow 的 concurrency 串行，不会撞风控。
+    - cron: '0 23 * * *'
   workflow_dispatch:
     inputs:
       check_only:
@@ -42,6 +43,11 @@ on:
         required: false
         default: false
         type: boolean
+      reason:
+        description: '触发来源（watchdog 补跑时填 watchdog，仅用于日志区分）'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: qoder-checkin
@@ -89,6 +95,8 @@ jobs:
     name: 执行领取 · 主账号
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      exit_code: ${{ steps.checkin.outputs.exit_code }}
     steps:
 
       # 主账号先领、不额外等待；第二个号由 checkin_dynamic 的
@@ -132,10 +140,10 @@ jobs:
           rc=${PIPESTATUS[0]}
           set -e
           echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
-          # 10 = 窗口还没开（北京时间 10:00 前）。这不算失败，
-          # 但已无补签班，这一天会漏领 —— 打 warning 让 Actions 页面看得见。
+          # 10 = 窗口还没开（北京时间 10:00 前）。这不算失败、也不推手机；
+          # 由 qoder-watchdog.yml 巡检后按需补跑。
           if [ "$rc" = "10" ]; then
-            echo "::warning::当前还没到 10:00 领取窗口，本次未领取；已无补签班，今天将漏签。"
+            echo "::notice::当前还没到 10:00 领取窗口，本次未领取；状态巡检会在 10:05 起接手。"
             exit 0
           fi
           exit $rc
@@ -223,7 +231,7 @@ jobs:
           set -e
           echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
           if [ "$rc" = "10" ]; then
-            echo "::warning::${{ matrix.slot }} 还没到 10:00 领取窗口，本次未领取；已无补签班，今天将漏签。"
+            echo "::notice::${{ matrix.slot }} 还没到 10:00 领取窗口，本次未领取；状态巡检会在 10:05 起接手。"
             exit 0
           fi
           exit $rc
@@ -252,10 +260,12 @@ jobs:
   # ── 每日积分播报：签到完成后汇总所有账号，推一条到手机 ──────────
   # 独立于 heartbeat：即使某个账号失败也照常播报（失败账号明确标出），
   # 且播报失败不影响签到结果与心跳上报。RECOMMEND_NOTIFY=0 可整体关闭。
+  # 窗口未开（exit_code=10）时整条跳过 —— 时间没到不推手机，等巡检补跑后
+  # 由补跑那次 run 统一播报，避免早上收到一条「积分没变」的无效消息。
   daily_report:
     name: 每日积分播报
     needs: [checkin_main, checkin_dynamic]
-    if: ${{ always() && !cancelled() }}
+    if: ${{ always() && !cancelled() && needs.checkin_main.outputs.exit_code != '10' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
