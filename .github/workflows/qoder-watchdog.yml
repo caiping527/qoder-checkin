@@ -1,0 +1,67 @@
+name: Qoder 签到状态巡检
+
+# ─────────────────────────────────────────────────────────────
+#  状态驱动的「补跑」，替代固定补签班（避免与延迟落地的 7 点班撞车）。
+#
+#  主班：北京 07:00（UTC 23:00 前一天），GitHub cron 常延迟 3~7.5 小时，
+#        落点常在 10:00 领取窗口之后，届时主 workflow 自己就领了。
+#
+#  巡检：北京 10:05 起每 15 分钟一次，到 15:35。
+#        每次只读查「今天主 workflow 的 schedule run」，分三段：
+#          · 没有 run                → 主班还在调度延迟里（run 未创建），静默等
+#          · queued / in_progress   → 已落地但没跑完，静默等
+#          · 全部 completed         → 才看结果
+#        有「10:00 后成功」的 run → 已领到，静默收工。
+#        否则 → 需要补跑；15:00 后不再等排队，直接进入补跑判断。
+#        补跑前查今天 10:00 后是否已有 dispatch run，避免重复触发。
+#
+#  ⚠️ 巡检脚本绝不直接调 Qoder claim。补跑是 dispatch 主 workflow，
+#     由主 workflow 的幂等逻辑 + concurrency 串行 + 账号间隔 5 分钟执行，
+#     即使 7 点班恰好落地，也不会两个 run 同时发 claim。
+#
+#  推送语义：排队中 / 已领到 / 窗口未开 → 静默；
+#            补跑成功推 ✅、失败或超时推 ⚠️。
+# ─────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # UTC 02:05~06:50 = 北京 10:05~14:50，每 15 分钟
+    - cron: '5,20,35,50 2-6 * * *'
+    # UTC 07:05~07:35 = 北京 15:05~15:35，15:00 后的兜底巡检
+    - cron: '5,20,35 7 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只诊断、不触发补跑（演练用）'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: qoder-watchdog
+  cancel-in-progress: true        # 巡检只保留最新一次，避免堆叠
+
+permissions:
+  contents: read
+  actions: write                 # 查 runs + dispatch 主 workflow
+
+jobs:
+  inspect:
+    name: 状态巡检
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      WECOM_APP: ${{ secrets.WECOM_APP }}
+      QODER_WATCHDOG_DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 巡检并按需补跑
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python watchdog.py
