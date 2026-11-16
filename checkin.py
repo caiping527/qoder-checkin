@@ -143,6 +143,34 @@ def notify_wecom(title, content):
         return '异常(%s)' % type(e).__name__
 
 
+# ── 推送里的账号名：手机尾号 ────────────────────────────────
+# 上游 /api/v1/userinfo 返回完整 11 位 security_mobile（2026-11-16 实测四个号均如此）。
+# 这里只取末 4 位用于显示，完整号码绝不写进 result.json / 日志 / 推送。
+USERINFO_PATH = '/api/v1/userinfo'
+
+
+def phone_tail(token):
+    """返回形如「尾号 6717」的显示名；取不到返回空串（调用方回退原标签）。
+
+    只读一次 GET，不重试、不落盘、不影响签到与上传流程。
+    """
+    token = (token or '').strip()
+    if not token:
+        return ''
+    try:
+        req = urllib.request.Request(
+            OPENAPI + USERINFO_PATH,
+            headers={'Accept': 'application/json',
+                     'Authorization': 'Bearer ' + token})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            body = json.loads(r.read().decode('utf-8', 'replace') or '{}')
+    except Exception:
+        return ''
+    digits = ''.join(ch for ch in str((body or {}).get('security_mobile') or '')
+                     if ch.isdigit())
+    return ('尾号 ' + digits[-4:]) if len(digits) >= 4 else ''
+
+
 def _origin():
     if os.environ.get('GITHUB_ACTIONS') == 'true':
         return 'GitHub 云端定时任务'
@@ -386,6 +414,11 @@ def save(result):
         result['expiry'] = query_balance(_ACTIVE_TOKEN)
     except Exception as e:
         result['expiry'] = {'error': '查询异常 %s' % type(e).__name__}
+    # 推送与每日播报统一显示「尾号 XXXX」：取不到就保留 workflow 给的标签。
+    # 只改展示字段 account，不改 uid / outcome / credit / exit code。
+    tail = phone_tail(_ACTIVE_TOKEN or ACCESS_TOKEN)
+    if tail:
+        result['account'] = tail
     # 失败才推送：成功/已领不打扰（与 WorkBuddy 的 SUCCESS_NOTIFY 默认关一致）
     if result.get('outcome') == 'failed':
         try:
