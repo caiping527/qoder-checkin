@@ -35,7 +35,7 @@ on:
     #   Actions 显示绿色、不推手机，由 qoder-watchdog.yml 在 10:05 起每 15 分钟
     #   只读巡检、确认主班跑完仍没领到时再 dispatch 本 workflow 补跑。
     #   ⚠️ 巡检不直接 claim，靠本 workflow 的 concurrency 串行，不会撞风控。
-    - cron: '0 23 * * *'
+    - cron: '0 23 * * *'   # 北京时间 07:00（Qoder 签到 · 签到时间）
   workflow_dispatch:
     inputs:
       check_only:
