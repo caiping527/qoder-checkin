@@ -86,6 +86,8 @@ def load_rows(root):
         account = str(data.get("account") or fallback or dir_name or "未命名账号")
         status = str(data.get("status") or data.get("outcome") or "unknown")
         message = str(data.get("message") or data.get("msg") or "")
+        # 今天这次实际领到多少分：和 outcome 一起判断「今天有没有新加一笔」
+        today_claim_credit = num(data.get("credit"))
         err = str(exp.get("error") or "")
         credits = num(exp.get("credits")) if not err else 0.0
         # 新口径：套餐剩余与资源包剩余分开；老数据（无 addon_remaining）
@@ -112,6 +114,7 @@ def load_rows(root):
             "addon_remaining": max(0.0, addon),
             "addon_total": max(0.0, addon_total),
             "addon_used": max(0.0, addon_used),
+            "today_claim_credit": max(0.0, today_claim_credit),
             "expire_date": str(exp.get("earliest_expire_date") or ""),
             "days_left": days if isinstance(days, (int, float)) else None,
             "use_by": str(exp.get("use_by") or ""),
@@ -142,18 +145,37 @@ def ledger_for(row, claims, today):
     return hits
 
 
+def claimed_today(row):
+    """今天到底有没有领到一笔——决定「最后一笔」的基准日，不能默认成功。
+
+    outcome 四态：
+      claimed  = 今天真领到（credit>0 才算真加了一笔）
+      done     = 今天已领过（今天确实有这一笔）
+      ineligible / failed / error = 今天没领到 → 最后一笔只能在前几天
+    返回值只影响推算，不影响签到主流程。
+    """
+    status = str(row.get("status") or "")
+    if status == "done":
+        return True
+    if status == "claimed" and num(row.get("today_claim_credit")) > 0:
+        return True
+    return False
+
+
 def addon_expiry(row, claims, today):
     """资源包「最早到期日」——随消耗自动往后推，不用人工记账。
 
     依据（官方规则）：每天领 100 分、每笔领取后 30 天有效、先到期先用。
     上游 me/usage 直接给资源包的 total / used / remaining，所以消耗量不用猜：
-      · 最后一笔的到期日 = 账本里最新一笔的 expireAt；没账本时按「今天领过」= 今天+30；
+      · 最后一笔的到期日：优先用账本里最新一笔的 expireAt（精确）；
+        没账本时按今天签到结果推——今天领到了 = 今天+30；
+        今天没领到（failed/ineligible/error）= 今天+29（只可能更早，往早算更保守）；
       · 剩余笔数 lots = ceil(remaining / 100)；
       · 最早到期日 = 最后一笔到期日 - (lots - 1) 天；
       · 当天到期量 = remaining - (lots - 1) * 100（那一天可能不满 100 分）。
-    例：700 分（7 笔）今天领 → 最早 12-13；用了 350 分剩 350（4 笔）→ 最早 12-16，
+    例：700 分（7 笔）今天领到 → 最早 12-13；用了 350 分剩 350（4 笔）→ 最早 12-16，
         12-16 当天到期 50 分。
-    账本断档只影响「最后一笔是哪天」，最多差 1 天，文案统一用「约」。
+    账本断档或今天漏签只影响「最后一笔是哪天」，误差按天计，文案统一用「约」。
     """
     remaining = row.get("addon_remaining") or 0
     if remaining <= 0:
@@ -162,7 +184,9 @@ def addon_expiry(row, claims, today):
     last = str(hits[-1].get("expireAt") or "") if hits else ""
     if not last:
         base = today if isinstance(today, date) else date.fromisoformat(str(today))
-        last = (base + timedelta(days=30)).isoformat()
+        # 今天没签到成功 → 最后一笔不可能在今天，往早推一天，避免把到期日算晚
+        offset = 0 if claimed_today(row) else 1
+        last = (base + timedelta(days=30 - offset)).isoformat()
     lots = max(1, int(math.ceil(remaining / float(LOT_SIZE))))
     earliest = date.fromisoformat(last) - timedelta(days=lots - 1)
     day_amount = round(remaining - (lots - 1) * LOT_SIZE, 2)
@@ -221,8 +245,8 @@ def build_text(rows, title, claims, run_url=None):
             lines.append("   当前积分：未取到")
         for part in expiry_lines(r, claims, today):
             lines.append("   " + part)
-        if r["status"] in ("error", "failed") and r["message"]:
-            lines.append("   ⚠️ 签到状态：%s" % r["message"][:60])
+        if r["status"] in ("error", "failed", "ineligible") and r["message"]:
+            lines.append("   ⚠️ 今天没领到：%s" % r["message"][:60])
         lines.append("")
 
     lines.append("注：套餐按周期整批到期；签到积分每笔 30 天，滚动到期。")
