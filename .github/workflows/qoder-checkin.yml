@@ -262,12 +262,21 @@ jobs:
   # 且播报失败不影响签到结果与心跳上报。RECOMMEND_NOTIFY=0 可整体关闭。
   # 窗口未开（exit_code=10）时整条跳过 —— 时间没到不推手机，等巡检补跑后
   # 由补跑那次 run 统一播报，避免早上收到一条「积分没变」的无效消息。
+  #
+  # 领取账本（2026-11-19 新增）：
+  #   Qoder 官方接口只有「总积分 + 本周期到期日」，没有逐笔明细。
+  #   签到这一步是确定信息（每笔 100 分、领取后 30 天各自到期），
+  #   所以把每次真领到的结果合并进 ledger/claims.json 并提交回仓库，
+  #   播报与本地推算都读它 → 能精确回答「某一天有多少分要过期」。
+  #   只有本 job 需要写仓库，顶层仍是 contents: read。
   daily_report:
     name: 每日积分播报
     needs: [checkin_main, checkin_dynamic]
     if: ${{ always() && !cancelled() && needs.checkin_main.outputs.exit_code != '10' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write        # 仅用于提交领取账本，其余 job 仍只读
     env:
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
       WECOM_APP: ${{ secrets.WECOM_APP }}
@@ -275,6 +284,9 @@ jobs:
       REPORT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 账本要 pull --rebase 再 push，浅克隆会缺历史导致 rebase 失败
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -287,9 +299,33 @@ jobs:
           pattern: qoder-expiry-*
           path: _report
 
+      - name: 合并领取账本
+        id: ledger
+        run: |
+          python merge_ledger.py _report | tee _ledger.log
+          added=$(sed -n 's/^LEDGER_ADDED=//p' _ledger.log | tail -1)
+          echo "added=${added:-0}" >> "$GITHUB_OUTPUT"
+
+      - name: 提交领取账本
+        if: ${{ steps.ledger.outputs.added != '0' }}
+        run: |
+          git config user.name "qoder-checkin-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add ledger/claims.json
+          if git diff --staged --quiet; then echo "账本无变化，跳过提交"; exit 0; fi
+          git commit -m "chore(ledger): Qoder 领取记账 $(TZ=Asia/Shanghai date +%F)"
+          for i in 1 2 3; do
+            if git pull --rebase origin "${{ github.ref_name }}" && git push; then
+              echo "账本已提交（第 $i 次尝试）"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::warning::账本提交失败（已重试 3 次），本次播报仍用本地合并结果"
+
       - name: 汇总积分并推送每日播报
         run: |
-          python daily_report.py _report --title Qoder | tee _daily.md
+          python daily_report.py _report --title Qoder --file ledger/claims.json | tee _daily.md
           cat _daily.md >> "$GITHUB_STEP_SUMMARY"
 
   # ── 心跳上报（自动心跳监测注入，勿删）──────────────────────

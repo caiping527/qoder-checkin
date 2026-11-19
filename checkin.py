@@ -50,6 +50,11 @@ EXIT_WINDOW_CLOSED = 10
 DESKTOP_CLIENT_TYPE = '10'
 DESKTOP_CLIENT_VERSION = '0.5.3'
 
+# 领取记账用的有效期：官方《每日领取 100 Credits》规则——
+# 「每笔奖励自领取之日起 30 天内有效，每笔奖励分别计算到期时间，
+#  后续领取不会延长此前奖励的有效期」。改规则时只改这里。
+CLAIM_VALID_DAYS = 30
+
 CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns'
 CLAIM_PATH = '/sash/api/v1/me/campaigns/%s/claim'
 REFRESH_PATH = '/api/v1/deviceToken/refresh'
@@ -74,7 +79,7 @@ RESULT = {
 
 
 # ── 企业微信通知（与小浣熊 / WorkBuddy 同一套做法） ──────────
-# 只读 工具箱/配置.json 的 wecom 字段（4 段：corpid,corpsecret,touser,agentid）。
+# 只读 参数配置/配置.json 的 wecom 字段（4 段：corpid,corpsecret,touser,agentid）。
 # 云端跑时该文件不存在，改为读 WECOM_APP 环境变量（由 workflow 从 Secret 注入，
 # 与「每日积分播报」共用同一个 Secret）。兼容旧的 QODER_WECOM_APP 名称。
 
@@ -361,10 +366,19 @@ def _expiry_date_text(ms):
 def query_balance(token):
     """只读查询余额与额度周期结束日，返回白名单结构。
 
-    与 AiRoute channels/plugins/qoder/protocol.js 的 parseUsageBalance 同口径：
-    总积分 = Σ 各 quota / 资源包的 remaining；周期结束日取 usage.expiresAt。
-    这里只做 GET 只读，绝不触发任何领取动作；任何异常都降级成 error 字段，
-    绝不影响签到主流程或退出码。
+    ⚠️ 口径（2026-11-19 起修正）：
+    Qoder 有两条独立的到期线，绝不能合成一个日期——
+      · 套餐额度（userQuota）：随本周期结束日 expiresAt 整批到期/刷新；
+      · 签到资源包（addOnQuota / dedicatedResourcePackages / orgResourcePackages）：
+        每笔领取自领取之日起 30 天内有效、各自滚动到期（官方活动规则），
+        与套餐周期无关。
+    因此这里拆成三个字段：
+      credits           = 当前总积分（套餐剩余 + 资源包剩余），供「当前积分」显示；
+      earliest_remaining= 套餐剩余（真正随 expiresAt 到期的那部分）；
+      addon_remaining   = 资源包剩余（按笔 30 天滚动，需用领取账本推算逐笔到期）。
+    旧版把 total 塞进 earliest_remaining，播报会出现「这批 XXX 分 11-27 到期」，
+    而其中资源包根本不在那天过期 —— 这是用户实测反馈的错误口径，已修正。
+    任何异常都降级成 error 字段，绝不影响签到主流程或退出码。
     """
     out = {}
     if not token:
@@ -380,19 +394,29 @@ def query_balance(token):
         if not isinstance(usage, dict):
             return {'error': '余额响应缺少 qoderUsage'}
         total = 0.0
+        plan_remaining = 0.0
+        addon_remaining = 0.0
         for key in ('userQuota', 'addOnQuota'):
             q = usage.get(key)
             if isinstance(q, dict):
-                total += _num(q.get('remaining'))
+                val = _num(q.get('remaining'))
+                total += val
+                if key == 'userQuota':
+                    plan_remaining += val
+                else:
+                    addon_remaining += val
         for key in ('dedicatedResourcePackages', 'orgResourcePackages'):
             for pkg in (usage.get(key) or []):
                 if isinstance(pkg, dict):
-                    total += _num(pkg.get('remaining'))
+                    val = _num(pkg.get('remaining'))
+                    total += val
+                    addon_remaining += val
         exp_ms = usage.get('expiresAt') or usage.get('refreshAt')
         exp_date, days, use_by = _expiry_date_text(exp_ms)
         out = {
             'credits': total,
-            'earliest_remaining': total,
+            'earliest_remaining': plan_remaining,
+            'addon_remaining': addon_remaining,
             'label': '本周期额度到期',
         }
         if exp_date:
@@ -419,6 +443,24 @@ def save(result):
     tail = phone_tail(_ACTIVE_TOKEN or ACCESS_TOKEN)
     if tail:
         result['account'] = tail
+    # ── 领取记账（GitHub 账本 ledger/claims.json 的数据源）────────
+    # 只有「真领到」才记一笔；已领/失败/窗口未开都不记，账本里永远是有效领取。
+    # 记的是领取时刻 + 分数 + 30 天后的到期日，供 daily_report 与本地推算
+    # 「每笔什么时候过期、某一天要过期多少分」。构造失败不影响签到结果。
+    try:
+        credit = float(result.get('credit') or 0)
+        if result.get('outcome') == 'claimed' and credit > 0:
+            at = datetime.now(BEIJING)
+            result['claim'] = {
+                'uid': UID or '',
+                'account': result.get('account') or LABEL,
+                'credit': credit,
+                'claimedAt': at.isoformat(timespec='seconds'),
+                'validDays': CLAIM_VALID_DAYS,
+                'expireAt': (at + timedelta(days=CLAIM_VALID_DAYS)).date().isoformat(),
+            }
+    except Exception as e:
+        log('[!] 领取记账字段构造失败（不影响签到）：%s' % e)
     # 失败才推送：成功/已领不打扰（与 WorkBuddy 的 SUCCESS_NOTIFY 默认关一致）
     if result.get('outcome') == 'failed':
         try:
