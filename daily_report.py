@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import re
 import sys
@@ -92,9 +93,13 @@ def load_rows(root):
         if "addon_remaining" in exp and not err:
             addon = num(exp.get("addon_remaining"))
             plan = num(exp.get("earliest_remaining"))
+            addon_total = num(exp.get("addon_total"))
+            addon_used = num(exp.get("addon_used"))
         else:
             addon = 0.0
             plan = num(exp.get("earliest_remaining")) if not err else 0.0
+            addon_total = 0.0
+            addon_used = 0.0
         days = exp.get("days_left")
         rows.append({
             "account": account,
@@ -105,6 +110,8 @@ def load_rows(root):
             "credits": credits,
             "plan_remaining": max(0.0, plan),
             "addon_remaining": max(0.0, addon),
+            "addon_total": max(0.0, addon_total),
+            "addon_used": max(0.0, addon_used),
             "expire_date": str(exp.get("earliest_expire_date") or ""),
             "days_left": days if isinstance(days, (int, float)) else None,
             "use_by": str(exp.get("use_by") or ""),
@@ -135,70 +142,59 @@ def ledger_for(row, claims, today):
     return hits
 
 
-def addon_estimate(addon_remaining, today):
-    """记账启用前的资源包：按 100 分/笔、连续领取估算笔数与最早到期日。
+def addon_expiry(row, claims, today):
+    """资源包「最早到期日」——随消耗自动往后推，不用人工记账。
 
-    只是兜底展示（明确标注「估算」）；记账跑起来后以账本为准。
-    today 允许传 date 或 "YYYY-MM-DD" 字符串（两种调用点都有）。
+    依据（官方规则）：每天领 100 分、每笔领取后 30 天有效、先到期先用。
+    上游 me/usage 直接给资源包的 total / used / remaining，所以消耗量不用猜：
+      · 最后一笔的到期日 = 账本里最新一笔的 expireAt；没账本时按「今天领过」= 今天+30；
+      · 剩余笔数 lots = ceil(remaining / 100)；
+      · 最早到期日 = 最后一笔到期日 - (lots - 1) 天；
+      · 当天到期量 = remaining - (lots - 1) * 100（那一天可能不满 100 分）。
+    例：700 分（7 笔）今天领 → 最早 12-13；用了 350 分剩 350（4 笔）→ 最早 12-16，
+        12-16 当天到期 50 分。
+    账本断档只影响「最后一笔是哪天」，最多差 1 天，文案统一用「约」。
     """
-    if addon_remaining <= 0:
+    remaining = row.get("addon_remaining") or 0
+    if remaining <= 0:
         return None
-    base = today if isinstance(today, date) else date.fromisoformat(str(today))
-    lots = max(1, int(round(addon_remaining / float(LOT_SIZE))))
-    earliest = base - timedelta(days=lots - 1) + timedelta(days=30)
-    return {"lots": lots, "earliest": earliest.isoformat()}
+    hits = ledger_for(row, claims, today)
+    last = str(hits[-1].get("expireAt") or "") if hits else ""
+    if not last:
+        base = today if isinstance(today, date) else date.fromisoformat(str(today))
+        last = (base + timedelta(days=30)).isoformat()
+    lots = max(1, int(math.ceil(remaining / float(LOT_SIZE))))
+    earliest = date.fromisoformat(last) - timedelta(days=lots - 1)
+    day_amount = round(remaining - (lots - 1) * LOT_SIZE, 2)
+    return {"earliest": earliest.isoformat(), "lots": lots, "day_amount": day_amount}
 
 
 def expiry_lines(r, claims, today):
-    """一个账号的到期说明（纯文本多行，手机上看得清）。"""
+    """一个账号的到期说明：套餐一行 + 资源包一行，不展开内部细节。"""
     if not r["has_data"]:
         if r["error"]:
-            return ["积分数据未取到（%s）" % r["error"][:50]]
-        return ["积分数据未取到（本次签到可能失败，见下方告警）"]
+            return ["积分未取到（%s）" % r["error"][:40]]
+        return ["积分未取到"]
 
     lines = []
-    # ① 套餐额度：随本周期整批到期
-    if r["expire_date"]:
+    # ① 套餐额度：随本周期整批到期（用完了就不再提）
+    plan = r["plan_remaining"]
+    if plan > 0 and r["expire_date"]:
         days = r["days_left"] if r["days_left"] is not None else "?"
-        head = "套餐额度：%g 分于 %s 到期（剩 %s 天）" % (
-            r["plan_remaining"], r["expire_date"], days)
+        line = "%g 分于 %s 到期（剩 %s 天）" % (plan, r["expire_date"], days)
         if isinstance(r["days_left"], (int, float)) and r["days_left"] <= 1:
-            head += "；⚠️ 今明两天就到期，今天就用掉"
-        elif r["use_by"] and r["plan_remaining"] > 0:
-            head += "；建议 %s 前用掉，提前一天" % r["use_by"]
-        elif r["plan_remaining"] <= 0:
-            head += "；套餐已用完"
-        lines.append(head)
-    else:
-        lines.append("套餐额度：未标注到期日")
+            line += "；今天就用掉"
+        elif r["use_by"]:
+            line += "；建议 %s 前用掉，提前一天" % r["use_by"]
+        lines.append(line)
 
-    # ② 签到资源包：每笔 30 天各自滚动到期（账本精确，历史估算）
-    addon = r["addon_remaining"]
-    hits = ledger_for(r, claims, today)
-    if addon <= 0 and not hits:
-        lines.append("签到资源包：0 分")
-        return lines
-    if hits:
-        booked = sum(num(c.get("credit")) for c in hits)
-        first = hits[0]
-        first_day = str(first.get("expireAt") or "")
-        same_day = [c for c in hits if str(c.get("expireAt") or "") == first_day]
-        same_amount = sum(num(c.get("credit")) for c in same_day)
-        part = "签到资源包：%g 分，账本 %d 笔，最早 %s 到期 %g 分" % (
-            addon, len(hits), first_day or "?", same_amount)
-        if addon - booked > 0.01:
-            est = addon_estimate(addon - booked, today)
-            if est:
-                part += "；另有 %g 分属记账前（约 %d 笔，最早约 %s）" % (
-                    addon - booked, est["lots"], est["earliest"])
-        lines.append(part)
-    else:
-        est = addon_estimate(addon, today)
-        if est:
-            lines.append("签到资源包：%g 分，约 %d 笔（记账未覆盖，估算），最早约 %s 到期" % (
-                addon, est["lots"], est["earliest"]))
+    # ② 签到资源包：按剩余量算「最早哪天开始到期」，消耗后自动往后推
+    est = addon_expiry(r, claims, today)
+    if est:
+        if est["day_amount"] < LOT_SIZE:
+            lines.append("%g 分约 %s 起陆续到期" % (r["addon_remaining"], est["earliest"]))
         else:
-            lines.append("签到资源包：%g 分，到期日未记账" % addon)
+            lines.append("%g 分约 %s 到期" % (r["addon_remaining"], est["earliest"]))
     return lines
 
 
@@ -206,8 +202,7 @@ def build_text(rows, title, claims, run_url=None):
     """企微纯文本，不用 Markdown 符号，手机上看得清。"""
     now = datetime.now(BEIJING)
     today = now.date().isoformat()
-    lines = ["【%s · 每日积分播报】%s" % (title, now.strftime("%Y-%m-%d")),
-             "每个号的当前积分，以及积分什么时候到期、该提前哪天用掉：", ""]
+    lines = ["【%s · 每日积分播报】%s" % (title, now.strftime("%Y-%m-%d")), ""]
     if not rows:
         lines.append("本次没有收到任何账号的积分数据，请查看运行详情。")
         if run_url:
@@ -221,11 +216,7 @@ def build_text(rows, title, claims, run_url=None):
     for i, r in enumerate(rows, 1):
         lines.append("%d. %s" % (i, r["account"]))
         if r["has_data"]:
-            if r["addon_remaining"] > 0:
-                lines.append("   当前积分：%g 分（套餐 %g + 资源包 %g）" % (
-                    r["credits"], r["plan_remaining"], r["addon_remaining"]))
-            else:
-                lines.append("   当前积分：%g 分" % r["credits"])
+            lines.append("   当前积分：%g 分" % r["credits"])
         else:
             lines.append("   当前积分：未取到")
         for part in expiry_lines(r, claims, today):
@@ -234,53 +225,37 @@ def build_text(rows, title, claims, run_url=None):
             lines.append("   ⚠️ 签到状态：%s" % r["message"][:60])
         lines.append("")
 
-    # ③ 未来 7 天到期合计：套餐 + 资源包（账本精确项 + 估算项单列）
-    plan_soon = [r for r in rows if r["has_data"] and r["days_left"] is not None
-                 and r["days_left"] <= 7 and r["plan_remaining"] > 0]
-    plan_sum = sum(r["plan_remaining"] for r in plan_soon)
-    limit = (now.date() + timedelta(days=7)).isoformat()
-    ledger_soon = [c for c in claims if isinstance(c, dict)
-                   and str(c.get("expireAt") or "") and today <= str(c.get("expireAt") or "") <= limit]
-    ledger_sum = sum(num(c.get("credit")) for c in ledger_soon)
-    total = plan_sum + ledger_sum
-    lines.append("未来 7 天到期合计：%g 分" % total)
-    if plan_soon:
-        lines.append("   · 套餐：%s" % "、".join(
-            "%s %g 分" % (r["expire_date"], r["plan_remaining"]) for r in plan_soon))
-    if ledger_soon:
-        lines.append("   · 资源包：%s" % "、".join(
-            "%s %g 分" % (c.get("expireAt"), num(c.get("credit"))) for c in ledger_soon))
-    if not plan_soon and not ledger_soon:
-        book = [c for c in claims if isinstance(c, dict) and str(c.get("expireAt") or "") >= today]
-        if book:
-            lines.append("   （资源包最早 %s 到期，不在 7 天内）" % book[0].get("expireAt"))
-    lines.append("注：套餐额度随本周期整批到期；签到资源包每笔领取后 30 天各自到期"
-                 "（官方规则）；数据来自云端只读余额查询与领取账本。")
+    lines.append("注：套餐按周期整批到期；签到积分每笔 30 天，滚动到期。")
     if run_url:
         lines.append("运行详情：%s" % run_url)
     return "\n".join(lines)
 
 
 def build_report(rows, title, claims, today):
-    """Markdown 榜单，写进 Actions Summary。"""
-    lines = ["#### %s · 每日积分播报（按套餐到期日排序）" % title, "",
-             "| # | 账号 | 当前积分 | 套餐剩余 | 资源包 | 套餐到期日 | 剩几天 | 资源包最早到期 | 签到状态 |",
-             "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    """Markdown 榜单，写进 Actions Summary（与手机版同口径，只是排版好看点）。"""
+    lines = ["#### %s · 每日积分播报" % title, "",
+             "| # | 账号 | 当前积分 | 套餐到期 | 积分约到期 | 签到状态 |",
+             "| --- | --- | --- | --- | --- | --- |"]
     for i, r in enumerate(rows, 1):
-        hits = ledger_for(r, claims, today) if r["has_data"] else []
-        addon_exp = hits[0].get("expireAt") if hits else "—"
-        lines.append("| %d | %s | %s | %s | %s | %s | %s | %s | %s |" % (
-            i, r["account"],
-            "**%g**" % r["credits"] if r["has_data"] else "未取到",
-            "%g 分" % r["plan_remaining"] if r["has_data"] else "—",
-            "%g 分" % r["addon_remaining"] if r["has_data"] else "—",
-            r["expire_date"] or "—",
-            r["days_left"] if r["days_left"] is not None else "—",
-            "%s（%d 笔）" % (addon_exp, len(hits)) if hits else "—",
+        if not r["has_data"]:
+            lines.append("| %d | %s | 未取到 | — | — | %s |" % (
+                i, r["account"], "失败" if r["status"] in ("error", "failed") else "成功"))
+            continue
+        plan = "—"
+        if r["plan_remaining"] > 0 and r["expire_date"]:
+            plan = "%g 分 / %s（剩 %s 天）" % (
+                r["plan_remaining"], r["expire_date"],
+                r["days_left"] if r["days_left"] is not None else "?")
+        est = addon_expiry(r, claims, today)
+        addon = "—"
+        if est:
+            addon = "%g 分 / 约 %s" % (r["addon_remaining"], est["earliest"])
+        lines.append("| %d | %s | **%g** | %s | %s | %s |" % (
+            i, r["account"], r["credits"], plan, addon,
             "失败" if r["status"] in ("error", "failed") else "成功"))
     lines.append("")
-    lines.append("> 套餐剩余取云端只读余额接口（随本周期到期日整批到期）；"
-                 "签到资源包按笔记录，每笔领取后 30 天各自到期（账本 ledger/claims.json）。")
+    lines.append("> 套餐按周期整批到期；签到积分每笔领取后 30 天滚动到期，"
+                 "剩余量减少时「约到期日」自动往后推。")
     if not rows:
         lines.append("")
         lines.append("- 本次没有收到任何账号的积分数据。")

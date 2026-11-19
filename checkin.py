@@ -372,10 +372,11 @@ def query_balance(token):
       · 签到资源包（addOnQuota / dedicatedResourcePackages / orgResourcePackages）：
         每笔领取自领取之日起 30 天内有效、各自滚动到期（官方活动规则），
         与套餐周期无关。
-    因此这里拆成三个字段：
+    因此这里拆成：
       credits           = 当前总积分（套餐剩余 + 资源包剩余），供「当前积分」显示；
       earliest_remaining= 套餐剩余（真正随 expiresAt 到期的那部分）；
-      addon_remaining   = 资源包剩余（按笔 30 天滚动，需用领取账本推算逐笔到期）。
+      addon_remaining   = 资源包剩余（按笔 30 天滚动）；
+      addon_total/used  = 资源包累计发放 / 已消耗（上游直给，用来推算「最早哪天到期」）。
     旧版把 total 塞进 earliest_remaining，播报会出现「这批 XXX 分 11-27 到期」，
     而其中资源包根本不在那天过期 —— 这是用户实测反馈的错误口径，已修正。
     任何异常都降级成 error 字段，绝不影响签到主流程或退出码。
@@ -396,6 +397,8 @@ def query_balance(token):
         total = 0.0
         plan_remaining = 0.0
         addon_remaining = 0.0
+        addon_total = 0.0
+        addon_used = 0.0
         for key in ('userQuota', 'addOnQuota'):
             q = usage.get(key)
             if isinstance(q, dict):
@@ -405,18 +408,26 @@ def query_balance(token):
                     plan_remaining += val
                 else:
                     addon_remaining += val
+                    # 资源包的「累计发放 / 已消耗」：上游直接给，不用猜。
+                    # 已消耗 + 剩余 = 累计发放；据此可推算「还剩几笔、最早哪天到期」。
+                    addon_total += _num(q.get('total'))
+                    addon_used += _num(q.get('used'))
         for key in ('dedicatedResourcePackages', 'orgResourcePackages'):
             for pkg in (usage.get(key) or []):
                 if isinstance(pkg, dict):
                     val = _num(pkg.get('remaining'))
                     total += val
                     addon_remaining += val
+                    addon_total += _num(pkg.get('total'))
+                    addon_used += _num(pkg.get('used'))
         exp_ms = usage.get('expiresAt') or usage.get('refreshAt')
         exp_date, days, use_by = _expiry_date_text(exp_ms)
         out = {
             'credits': total,
             'earliest_remaining': plan_remaining,
             'addon_remaining': addon_remaining,
+            'addon_total': addon_total,
+            'addon_used': addon_used,
             'label': '本周期额度到期',
         }
         if exp_date:
