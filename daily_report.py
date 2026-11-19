@@ -212,13 +212,21 @@ def expiry_lines(r, claims, today):
             line += "；建议 %s 前用掉，提前一天" % r["use_by"]
         lines.append(line)
 
-    # ② 签到资源包：按剩余量算「最早哪天开始到期」，消耗后自动往后推
+    # ② 签到资源包：按剩余量算「最早哪天开始到期」，消耗后自动往后推。
+    # 说法要让人一眼看懂是「每天滚着到期」，不是一天全作废：
+    #   700 分约 2026-12-13 开始每天到期 100 分
+    #   剩余不是整百时首日不满 100（如 350 分 → 12-16 先到期 50 分，之后每天 100 分）
     est = addon_expiry(r, claims, today)
     if est:
-        if est["day_amount"] < LOT_SIZE:
-            lines.append("%g 分约 %s 起陆续到期" % (r["addon_remaining"], est["earliest"]))
+        remaining = r["addon_remaining"]
+        if est["lots"] == 1:
+            lines.append("%g 分约 %s 到期" % (remaining, est["earliest"]))
+        elif est["day_amount"] >= LOT_SIZE:
+            lines.append("%g 分约 %s 开始每天到期 %g 分" % (
+                remaining, est["earliest"], LOT_SIZE))
         else:
-            lines.append("%g 分约 %s 到期" % (r["addon_remaining"], est["earliest"]))
+            lines.append("%g 分约 %s 开始到期 %g 分，之后每天 %g 分" % (
+                remaining, est["earliest"], est["day_amount"], LOT_SIZE))
     return lines
 
 
@@ -273,7 +281,14 @@ def build_report(rows, title, claims, today):
         est = addon_expiry(r, claims, today)
         addon = "—"
         if est:
-            addon = "%g 分 / 约 %s" % (r["addon_remaining"], est["earliest"])
+            if est["lots"] == 1:
+                addon = "%g 分 / 约 %s" % (r["addon_remaining"], est["earliest"])
+            elif est["day_amount"] >= LOT_SIZE:
+                addon = "%g 分 / %s 起每天 %g 分" % (
+                    r["addon_remaining"], est["earliest"], LOT_SIZE)
+            else:
+                addon = "%g 分 / %s 起 %g 分，之后每天 %g 分" % (
+                    r["addon_remaining"], est["earliest"], est["day_amount"], LOT_SIZE)
         lines.append("| %d | %s | **%g** | %s | %s | %s |" % (
             i, r["account"], r["credits"], plan, addon,
             "失败" if r["status"] in ("error", "failed") else "成功"))
