@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-11-22T11:00:47+08:00",
+  "updatedAt": "2026-11-23T11:39:17+08:00",
   "rule": "每笔领取自领取之日起 30 天内有效，各自滚动到期（Qoder 官方活动规则）",
   "claims": [
     {
@@ -98,6 +98,38 @@
       "claimedAt": "2026-11-22T11:00:37+08:00",
       "validDays": 30,
       "expireAt": "2026-12-22"
+    },
+    {
+      "uid": "01a1e2da-1721-7219-8af1-79be4bf38071",
+      "account": "尾号 4060",
+      "credit": 100.0,
+      "claimedAt": "2026-11-23T11:23:25+08:00",
+      "validDays": 30,
+      "expireAt": "2026-12-23"
+    },
+    {
+      "uid": "01a1d9d6-63cd-7aad-9e30-3e345e3fc4b2",
+      "account": "尾号 7100",
+      "credit": 100.0,
+      "claimedAt": "2026-11-23T11:28:39+08:00",
+      "validDays": 30,
+      "expireAt": "2026-12-23"
+    },
+    {
+      "uid": "01a1d53b-01af-7b24-b277-58580154ae03",
+      "account": "尾号 6717",
+      "credit": 100.0,
+      "claimedAt": "2026-11-23T11:33:53+08:00",
+      "validDays": 30,
+      "expireAt": "2026-12-23"
+    },
+    {
+      "uid": "01a1e2d8-101d-7dd5-9575-fe870c3c4869",
+      "account": "尾号 9653",
+      "credit": 100.0,
+      "claimedAt": "2026-11-23T11:39:06+08:00",
+      "validDays": 30,
+      "expireAt": "2026-12-23"
     }
   ]
 }
