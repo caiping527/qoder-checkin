@@ -27,7 +27,6 @@ Qoder 有两条独立的到期线，绝不能合成一个日期——
 from __future__ import annotations
 
 import glob
-import io
 import json
 import math
 import os
@@ -35,7 +34,6 @@ import re
 import sys
 import urllib.parse
 import urllib.request
-import uuid
 from datetime import date, datetime, timedelta, timezone
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -46,207 +44,22 @@ BEIJING = timezone(timedelta(hours=8))
 DEFAULT_LEDGER = os.path.join("ledger", "claims.json")
 LOT_SIZE = 100  # 官方每天 100 Credits；估算历史笔数用
 
-# ── 企业微信 markdown 着色 ──────────────────────────────
-# 企微 markdown 只认 info（绿）/ warning（橙红）/ comment（灰）三种颜色，
-# 写别的色值会被当黑字，所以只暴露这三个语义名。
-C_INFO, C_WARN, C_NOTE = "info", "warning", "comment"
-MD_BYTE_LIMIT = 3800          # 企微 markdown 上限 4096 字节，留余量给截断提示
+TEXT_BYTE_LIMIT = 1900        # 企微 text 上限 2048 字节，留余量给截断提示
 
 
-def c(text, color=C_INFO):
-    return '<font color="%s">%s</font>' % (color, text)
-
-
-def strip_color(text):
-    """去掉颜色标签与加粗标记，用于纯文本降级。"""
-    return re.sub(r"\*\*", "", re.sub(r"</?font[^>]*>", "", text))
-
-
-def fit_markdown(text):
-    """超长按行截断：整条超限企微会直接拒收。"""
-    if len(text.encode("utf-8")) <= MD_BYTE_LIMIT:
-        return text
-    out, size = [], 0
-    for line in text.split("\n"):
-        n = len(line.encode("utf-8")) + 1
-        if size + n > MD_BYTE_LIMIT - 80:
-            break
-        out.append(line)
-        size += n
-    out.append(c("…内容过长已截断，完整数据见运行详情", C_NOTE))
-    return "\n".join(out)
-
-
-def fit_plain(text, limit=1900):
-    """纯文本兜底也要限长：企微 text 消息上限 2048 字节。"""
-    text = strip_color(text)
+def fit_text(text, limit=TEXT_BYTE_LIMIT):
+    """超长按行截断：整条超限企微会直接拒收，比截断更糟。"""
     if len(text.encode("utf-8")) <= limit:
         return text
     out, size = [], 0
     for line in text.split("\n"):
         n = len(line.encode("utf-8")) + 1
-        if size + n > limit - 60:
+        if size + n > limit - 80:
             break
         out.append(line)
         size += n
     out.append("…内容过长已截断，完整数据见运行详情")
     return "\n".join(out)
-
-
-# ── 彩色图卡（微信端唯一能上色的消息类型是 image）──────────
-# 微信只渲染 text / image；markdown 会被提示「暂不支持此消息类型」，
-# textcard 的 div 配色也不生效（实测）。所以彩色只能自己画成 PNG。
-FONT_CANDIDATES = (
-    r"C:\Windows\Fonts\simhei.ttf",
-    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/arphic/uming.ttc",
-)
-IMG_COLORS = {"info": (200, 35, 44), "warning": (232, 83, 31), "comment": (120, 120, 120)}
-IMG_WIDTH, IMG_PAD = 780, 28
-_TOKEN_RE = re.compile(r'<font color="(\w+)">(.*?)</font>|\*\*(.+?)\*\*', re.S)
-
-
-def _font_path():
-    for p in FONT_CANDIDATES:
-        if os.path.isfile(p):
-            return p
-    return ""
-
-
-def _segments(line):
-    """把一行 markdown 拆成 [(文字, 颜色, 是否加粗)]，没有标签的段落给 None。"""
-    out, pos = [], 0
-    for m in _TOKEN_RE.finditer(line):
-        if m.start() > pos:
-            out.append((line[pos:m.start()], None, False))
-        if m.group(1):
-            out.append((m.group(2), IMG_COLORS.get(m.group(1), (34, 34, 34)), False))
-        else:
-            out.append((m.group(3), None, True))
-        pos = m.end()
-    if pos < len(line):
-        out.append((line[pos:], None, False))
-    return [s for s in out if s[0]]
-
-
-# 中日韩字体没有 emoji 字形，直接画会变成方框；换成同义符号。
-_GLYPH_FIX = {"⚠️": "▲", "⚠": "▲", "✅": "√", "❌": "×", "⏭": "»",
-              "👉": "→", "🔴": "●", "🟢": "●", "\ufe0f": ""}
-
-
-def _plain_glyphs(text):
-    for k, v in _GLYPH_FIX.items():
-        text = text.replace(k, v)
-    return text
-
-
-def _break_units(text):
-    """把一段文字切成折行单元：连续的 ASCII（数字/日期/符号）算一个整体，
-    避免把 2026-12-04 这种日期从中间劈开；中文逐字成单元。"""
-    units, buf = [], ""
-    for ch in text:
-        if ch.isascii() and not ch.isspace():
-            buf += ch
-            continue
-        if buf:
-            units.append(buf)
-            buf = ""
-        units.append(ch)
-    if buf:
-        units.append(buf)
-    return units
-
-
-_TRAILING_PUNCT = "：；，。、）」』】！？%"
-
-
-def render_png(text):
-    """把播报渲染成 PNG 字节流；缺 Pillow 或中文字体时返回 None（调用方退回纯文本）。"""
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except Exception:  # noqa: BLE001 —— 云端没装 Pillow 就走纯文本
-        return None
-    fp = _font_path()
-    if not fp:
-        return None
-    try:
-        f_title = ImageFont.truetype(fp, 34)
-        f_body = ImageFont.truetype(fp, 26)
-    except Exception:  # noqa: BLE001
-        return None
-
-    rows = text.split("\n")
-    while rows and not rows[0].strip():
-        rows.pop(0)
-    while rows and not rows[-1].strip():
-        rows.pop()
-
-    # 先按像素宽度折行，得到 [(字体, [(文字, 字体, 颜色)])]
-    wrapped = []
-    for idx, line in enumerate(rows):
-        title = idx == 0
-        font = f_title if title else f_body
-        if not line.strip():
-            wrapped.append((font, []))
-            continue
-        cur, cur_w = [], 0.0
-        for chunk, color, _bold in _segments(_plain_glyphs(line)):
-            color = color or ((20, 20, 20) if title else (34, 34, 34))
-            for unit in _break_units(chunk):
-                w = font.getlength(unit)
-                # 收尾标点允许轻微越界，避免「：」被顶到下一行单独成行
-                over_ok = unit in _TRAILING_PUNCT and cur
-                if cur_w + w > IMG_WIDTH - IMG_PAD * 2 and cur and not over_ok:
-                    wrapped.append((font, cur))
-                    cur, cur_w = [], 0.0
-                if cur and cur[-1][1] is font and cur[-1][2] == color:
-                    cur[-1] = (cur[-1][0] + unit, font, color)
-                else:
-                    cur.append((unit, font, color))
-                cur_w += w
-        wrapped.append((font, cur))
-
-    height = IMG_PAD * 2
-    for font, segs in wrapped:
-        height += 48 if font is f_title else (18 if not segs else 40)
-    img = Image.new("RGB", (IMG_WIDTH, height), (255, 255, 255))
-    draw = ImageDraw.Draw(img)
-    y = IMG_PAD
-    for font, segs in wrapped:
-        if not segs:
-            y += 18
-            continue
-        x = IMG_PAD
-        for s, f, color in segs:
-            draw.text((x, y), s, font=f, fill=color)
-            x += f.getlength(s)
-        y += 48 if font is f_title else 40
-    buf = io.BytesIO()
-    img.save(buf, "PNG")
-    return buf.getvalue()
-
-
-def upload_image(token, png):
-    """上传临时素材拿 media_id；失败返回空串（调用方退回纯文本）。"""
-    boundary = "----wb%d" % uuid.uuid4().int
-    body = b"".join([
-        ("--%s\r\n" % boundary).encode(),
-        b'Content-Disposition: form-data; name="media"; filename="report.png"\r\n',
-        b"Content-Type: image/png\r\n\r\n", png, b"\r\n",
-        ("--%s--\r\n" % boundary).encode(),
-    ])
-    req = urllib.request.Request(
-        "%s/media/upload?access_token=%s&type=image" % (QYAPI, token),
-        data=body, method="POST",
-        headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            out = json.loads(resp.read().decode("utf-8", "replace"))
-        return out.get("media_id") or ""
-    except Exception:  # noqa: BLE001
-        return ""
 
 
 def truthy(v):
@@ -401,29 +214,20 @@ def addon_expiry(row, claims, today):
 
 
 def expiry_lines(r, claims, today):
-    """一个账号的到期说明：套餐一行 + 资源包一行，不展开内部细节。
+    """一个账号的到期说明，返回带 emoji 色标的纯文本行。
 
-    分数 / 到期日 / 剩余天数上色（临期≤1 天转橙红），便于手机上一眼扫到。
+    emoji 是微信里唯一真能显示颜色的东西：📅 到期日、⏰ 建议用掉日。
     """
     if not r["has_data"]:
-        if r["error"]:
-            return [c("积分未取到（%s）" % r["error"][:40], C_WARN)]
-        return [c("积分未取到", C_WARN)]
+        return []
 
     lines = []
     # ① 套餐额度：随本周期整批到期（用完了就不再提）
     plan = r["plan_remaining"]
+    urgent = isinstance(r["days_left"], (int, float)) and r["days_left"] <= 1
     if plan > 0 and r["expire_date"]:
         days = r["days_left"] if r["days_left"] is not None else "?"
-        urgent = isinstance(r["days_left"], (int, float)) and r["days_left"] <= 1
-        color = C_WARN if urgent else C_INFO
-        line = "%s于 %s 到期（剩 %s 天）" % (
-            c("%g 分" % plan, color), c(r["expire_date"], color), c("%s" % days, color))
-        if urgent:
-            line += "；" + c("今天就用掉", C_WARN)
-        elif r["use_by"]:
-            line += "；建议 %s 前用掉，提前一天" % c(r["use_by"], color)
-        lines.append(line)
+        lines.append("📅 套餐 %g 分于 %s 到期，剩 %s 天" % (plan, r["expire_date"], days))
 
     # ② 签到积分：分数一律用「当前总积分」（面板上那个数），日期按资源包剩余量推算。
     # 说法要让人一眼看懂是「每天滚着到期」，不细拆首日零头（误差按天计，可接受）：
@@ -431,46 +235,51 @@ def expiry_lines(r, claims, today):
     est = addon_expiry(r, claims, today)
     if est:
         if est["lots"] == 1:
-            lines.append("%s约 %s 到期" % (
-                c("%g 分" % r["credits"], C_INFO), c(est["earliest"], C_INFO)))
+            lines.append("📅 签到分 %g 分，约 %s 到期" % (r["credits"], est["earliest"]))
         else:
-            lines.append("%s约 %s 开始每天到期 %s" % (
-                c("%g 分" % r["credits"], C_INFO), c(est["earliest"], C_INFO),
-                c("%g 分" % LOT_SIZE, C_INFO)))
+            lines.append("📅 签到分 %g 分，约 %s 起每天到期 %g 分"
+                         % (r["credits"], est["earliest"], LOT_SIZE))
+
+    # ⏰ 只用一行，避免两个到期日各给一句「建议用掉」把人绕晕
+    if plan > 0 and r["expire_date"]:
+        if urgent:
+            lines.append("⏰ 今天就用掉，明天作废")
+        elif r["use_by"]:
+            lines.append("⏰ 建议 %s 前用掉（提前一天）" % r["use_by"])
     return lines
 
 
 def build_text(rows, title, claims, run_url=None):
-    """企微 markdown：积分、到期日、剩余天数用彩色字，其余说明文字保持黑白。"""
+    """手机播报：纯文本 + emoji 色标（微信端 markdown/图片都不可靠，只有 emoji 有颜色）。"""
     now = datetime.now(BEIJING)
     today = now.date().isoformat()
-    lines = ["**%s · 每日积分播报** %s" % (title, now.strftime("%Y-%m-%d")), ""]
+    lines = ["📌 %s · 每日积分播报" % title, "📅 %s" % now.strftime("%Y-%m-%d")]
     if not rows:
-        lines.append(c("本次没有收到任何账号的积分数据，请查看运行详情。", C_WARN))
+        lines.append("⚠️ 本次没有收到任何账号的积分数据，请查看运行详情")
         if run_url:
-            lines.append("运行详情：%s" % run_url)
-        return fit_markdown("\n".join(lines))
+            lines.append("🔗 运行详情：%s" % run_url)
+        return fit_text("\n".join(lines))
     # 缺口可见：少一个号时，数量本身就能提醒（小浣熊播报同一处理）
     bad = [r for r in rows if not r["has_data"]]
-    lines.append("本次收到 %d 个账号的积分数据%s" % (
-        len(rows), c("，其中 %d 个未取到（见上方）" % len(bad), C_WARN) if bad else ""))
-    lines.append("")
-    for i, r in enumerate(rows, 1):
-        lines.append("**%d. %s**" % (i, r["account"]))
-        if r["has_data"]:
-            lines.append("当前积分：%s" % c("%g 分" % r["credits"], C_INFO))
-        else:
-            lines.append("当前积分：%s" % c("未取到", C_WARN))
-        for part in expiry_lines(r, claims, today):
-            lines.append(part)
-        if r["status"] in ("error", "failed", "ineligible") and r["message"]:
-            lines.append(c("⚠️ 今天没领到：%s" % r["message"][:60], C_WARN))
+    lines.append("📣 收到 %d 个账号的积分数据%s" % (
+        len(rows), "，%d 个未取到" % len(bad) if bad else "，全部正常"))
+    for r in rows:
         lines.append("")
-
-    lines.append(c("注：套餐按周期整批到期；签到积分每笔 30 天，滚动到期。", C_NOTE))
+        lines.append(("🟩 " if r["has_data"] else "🟥 ") + r["account"])
+        if r["has_data"]:
+            lines.append("💰 当前积分 %g 分" % r["credits"])
+            for part in expiry_lines(r, claims, today):
+                lines.append(part)
+        else:
+            reason = (r["message"] or r["error"] or "未知原因")[:60]
+            lines.append("❗ 积分未取到：%s" % reason)
+        if r["has_data"] and r["status"] in ("error", "failed", "ineligible") and r["message"]:
+            lines.append("❗ 今天没领到：%s" % r["message"][:60])
+    lines.append("")
+    lines.append("⚪ 注：套餐按周期整批到期；签到积分每笔 30 天，滚动到期")
     if run_url:
-        lines.append("运行详情：%s" % run_url)
-    return fit_markdown("\n".join(lines))
+        lines.append("🔗 运行详情：%s" % run_url)
+    return fit_text("\n".join(lines))
 
 
 def build_report(rows, title, claims, today):
@@ -518,14 +327,8 @@ def post_json(url, payload):
 
 def push_webhook(value, content):
     url = value if value.startswith("http") else (QYAPI + "/webhook/send?key=" + value)
-    r = post_json(url, {"msgtype": "markdown", "markdown": {"content": content}})
-    if r.get("errcode") in (0, None):
-        return "webhook:%s" % (r.get("errmsg") or "ok")
-    # 通道不支持 / 拒收 markdown：降级纯文本，保证消息一定送到
-    first = r.get("errmsg") or r.get("errcode")
-    r = post_json(url, {"msgtype": "text", "text": {"content": fit_plain(content)}})
-    return "webhook:markdown失败(%s)降级text:%s" % (
-        first, r.get("errmsg") or r.get("errcode"))
+    r = post_json(url, {"msgtype": "text", "text": {"content": content}})
+    return "webhook:%s" % (r.get("errmsg") or r.get("errcode") or "ok")
 
 
 def push_app(value, content):
@@ -539,32 +342,11 @@ def push_app(value, content):
         t = json.loads(resp.read().decode("utf-8", "replace"))
     if t.get("errcode") != 0:
         return "app:gettoken失败 %s" % t.get("errmsg")
-    send_url = "%s/message/send?access_token=%s" % (QYAPI, t["access_token"])
-    token = t["access_token"]
-    note = ""
-    # 1) 先发彩色图卡：微信端只认 text / image，彩色只能画成图
-    png = render_png(content)
-    if png:
-        media_id = upload_image(token, png)
-        if media_id:
-            r = post_json(send_url, {
-                "touser": touser, "msgtype": "image", "agentid": agentid,
-                "image": {"media_id": media_id}, "safe": 0,
-            })
-            if r.get("errcode") == 0:
-                return "app:图卡 ok msgid=%s" % (r.get("msgid") or "-")
-            note = "图卡被拒(%s)降级text " % (r.get("errmsg") or r.get("errcode"))
-        else:
-            note = "图卡上传失败降级text "
-    else:
-        note = "无Pillow/字体降级text "
-    # 2) 兜底纯文本（没颜色但一定看得见）
-    r = post_json(send_url, {
+    r = post_json("%s/message/send?access_token=%s" % (QYAPI, t["access_token"]), {
         "touser": touser, "msgtype": "text", "agentid": agentid,
-        "text": {"content": fit_plain(content)}, "safe": 0,
+        "text": {"content": content}, "safe": 0,
     })
-    bits = ["%serrcode=%s" % (note, r.get("errcode")),
-            "errmsg=%s" % (r.get("errmsg") or "-")]
+    bits = ["errcode=%s" % r.get("errcode"), "errmsg=%s" % (r.get("errmsg") or "-")]
     if r.get("invaliduser"):
         bits.append("invaliduser=%s" % r["invaliduser"])
     if r.get("msgid"):
