@@ -20,6 +20,8 @@ Qoder 有两条独立的到期线，绝不能合成一个日期——
   python daily_report.py _report --file ledger/claims.json
 开关：RECOMMEND_NOTIFY=0 / off / false / no / none / disabled 关闭推送
 通道：WECOM_WEBHOOK（群机器人完整 webhook 或仅 key）、WECOM_APP（corpid,corpsecret,touser,agentid）
+排版：企微 markdown，积分 / 到期日 / 剩余天数用彩色字（企微只支持 info 绿 /
+      warning 橙红 / comment 灰）；通道不支持 markdown 时自动降级为纯文本。
 """
 from __future__ import annotations
 
@@ -40,6 +42,36 @@ QYAPI = "https://qyapi.weixin.qq.com/cgi-bin"
 BEIJING = timezone(timedelta(hours=8))
 DEFAULT_LEDGER = os.path.join("ledger", "claims.json")
 LOT_SIZE = 100  # 官方每天 100 Credits；估算历史笔数用
+
+# ── 企业微信 markdown 着色 ──────────────────────────────
+# 企微 markdown 只认 info（绿）/ warning（橙红）/ comment（灰）三种颜色，
+# 写别的色值会被当黑字，所以只暴露这三个语义名。
+C_INFO, C_WARN, C_NOTE = "info", "warning", "comment"
+MD_BYTE_LIMIT = 3800          # 企微 markdown 上限 4096 字节，留余量给截断提示
+
+
+def c(text, color=C_INFO):
+    return '<font color="%s">%s</font>' % (color, text)
+
+
+def strip_color(text):
+    """去掉颜色标签与加粗标记，用于纯文本降级。"""
+    return re.sub(r"\*\*", "", re.sub(r"</?font[^>]*>", "", text))
+
+
+def fit_markdown(text):
+    """超长按行截断：整条超限企微会直接拒收。"""
+    if len(text.encode("utf-8")) <= MD_BYTE_LIMIT:
+        return text
+    out, size = [], 0
+    for line in text.split("\n"):
+        n = len(line.encode("utf-8")) + 1
+        if size + n > MD_BYTE_LIMIT - 80:
+            break
+        out.append(line)
+        size += n
+    out.append(c("…内容过长已截断，完整数据见运行详情", C_NOTE))
+    return "\n".join(out)
 
 
 def truthy(v):
@@ -194,22 +226,28 @@ def addon_expiry(row, claims, today):
 
 
 def expiry_lines(r, claims, today):
-    """一个账号的到期说明：套餐一行 + 资源包一行，不展开内部细节。"""
+    """一个账号的到期说明：套餐一行 + 资源包一行，不展开内部细节。
+
+    分数 / 到期日 / 剩余天数上色（临期≤1 天转橙红），便于手机上一眼扫到。
+    """
     if not r["has_data"]:
         if r["error"]:
-            return ["积分未取到（%s）" % r["error"][:40]]
-        return ["积分未取到"]
+            return [c("积分未取到（%s）" % r["error"][:40], C_WARN)]
+        return [c("积分未取到", C_WARN)]
 
     lines = []
     # ① 套餐额度：随本周期整批到期（用完了就不再提）
     plan = r["plan_remaining"]
     if plan > 0 and r["expire_date"]:
         days = r["days_left"] if r["days_left"] is not None else "?"
-        line = "%g 分于 %s 到期（剩 %s 天）" % (plan, r["expire_date"], days)
-        if isinstance(r["days_left"], (int, float)) and r["days_left"] <= 1:
-            line += "；今天就用掉"
+        urgent = isinstance(r["days_left"], (int, float)) and r["days_left"] <= 1
+        color = C_WARN if urgent else C_INFO
+        line = "%s于 %s 到期（剩 %s 天）" % (
+            c("%g 分" % plan, color), c(r["expire_date"], color), c("%s" % days, color))
+        if urgent:
+            line += "；" + c("今天就用掉", C_WARN)
         elif r["use_by"]:
-            line += "；建议 %s 前用掉，提前一天" % r["use_by"]
+            line += "；建议 %s 前用掉，提前一天" % c(r["use_by"], color)
         lines.append(line)
 
     # ② 签到积分：分数一律用「当前总积分」（面板上那个数），日期按资源包剩余量推算。
@@ -218,44 +256,46 @@ def expiry_lines(r, claims, today):
     est = addon_expiry(r, claims, today)
     if est:
         if est["lots"] == 1:
-            lines.append("%g 分约 %s 到期" % (r["credits"], est["earliest"]))
+            lines.append("%s约 %s 到期" % (
+                c("%g 分" % r["credits"], C_INFO), c(est["earliest"], C_INFO)))
         else:
-            lines.append("%g 分约 %s 开始每天到期 %g 分" % (
-                r["credits"], est["earliest"], LOT_SIZE))
+            lines.append("%s约 %s 开始每天到期 %s" % (
+                c("%g 分" % r["credits"], C_INFO), c(est["earliest"], C_INFO),
+                c("%g 分" % LOT_SIZE, C_INFO)))
     return lines
 
 
 def build_text(rows, title, claims, run_url=None):
-    """企微纯文本，不用 Markdown 符号，手机上看得清。"""
+    """企微 markdown：积分、到期日、剩余天数用彩色字，其余说明文字保持黑白。"""
     now = datetime.now(BEIJING)
     today = now.date().isoformat()
-    lines = ["【%s · 每日积分播报】%s" % (title, now.strftime("%Y-%m-%d")), ""]
+    lines = ["**%s · 每日积分播报** %s" % (title, now.strftime("%Y-%m-%d")), ""]
     if not rows:
-        lines.append("本次没有收到任何账号的积分数据，请查看运行详情。")
+        lines.append(c("本次没有收到任何账号的积分数据，请查看运行详情。", C_WARN))
         if run_url:
             lines.append("运行详情：%s" % run_url)
-        return "\n".join(lines)
+        return fit_markdown("\n".join(lines))
     # 缺口可见：少一个号时，数量本身就能提醒（小浣熊播报同一处理）
     bad = [r for r in rows if not r["has_data"]]
     lines.append("本次收到 %d 个账号的积分数据%s" % (
-        len(rows), ("，其中 %d 个未取到（见上方）" % len(bad)) if bad else ""))
+        len(rows), c("，其中 %d 个未取到（见上方）" % len(bad), C_WARN) if bad else ""))
     lines.append("")
     for i, r in enumerate(rows, 1):
-        lines.append("%d. %s" % (i, r["account"]))
+        lines.append("**%d. %s**" % (i, r["account"]))
         if r["has_data"]:
-            lines.append("   当前积分：%g 分" % r["credits"])
+            lines.append("当前积分：%s" % c("%g 分" % r["credits"], C_INFO))
         else:
-            lines.append("   当前积分：未取到")
+            lines.append("当前积分：%s" % c("未取到", C_WARN))
         for part in expiry_lines(r, claims, today):
-            lines.append("   " + part)
+            lines.append(part)
         if r["status"] in ("error", "failed", "ineligible") and r["message"]:
-            lines.append("   ⚠️ 今天没领到：%s" % r["message"][:60])
+            lines.append(c("⚠️ 今天没领到：%s" % r["message"][:60], C_WARN))
         lines.append("")
 
-    lines.append("注：套餐按周期整批到期；签到积分每笔 30 天，滚动到期。")
+    lines.append(c("注：套餐按周期整批到期；签到积分每笔 30 天，滚动到期。", C_NOTE))
     if run_url:
         lines.append("运行详情：%s" % run_url)
-    return "\n".join(lines)
+    return fit_markdown("\n".join(lines))
 
 
 def build_report(rows, title, claims, today):
@@ -301,13 +341,19 @@ def post_json(url, payload):
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
-def push_webhook(value, text):
+def push_webhook(value, content):
     url = value if value.startswith("http") else (QYAPI + "/webhook/send?key=" + value)
-    r = post_json(url, {"msgtype": "text", "text": {"content": text}})
-    return "webhook:%s" % (r.get("errmsg") or r.get("errcode"))
+    r = post_json(url, {"msgtype": "markdown", "markdown": {"content": content}})
+    if r.get("errcode") in (0, None):
+        return "webhook:%s" % (r.get("errmsg") or "ok")
+    # 通道不支持 / 拒收 markdown：降级纯文本，保证消息一定送到
+    first = r.get("errmsg") or r.get("errcode")
+    r = post_json(url, {"msgtype": "text", "text": {"content": strip_color(content)}})
+    return "webhook:markdown失败(%s)降级text:%s" % (
+        first, r.get("errmsg") or r.get("errcode"))
 
 
-def push_app(value, text):
+def push_app(value, content):
     parts = [p.strip() for p in value.split(",")]
     if len(parts) < 4:
         return "app:配置格式错误（应为 corpid,corpsecret,touser,agentid）"
@@ -318,11 +364,20 @@ def push_app(value, text):
         t = json.loads(resp.read().decode("utf-8", "replace"))
     if t.get("errcode") != 0:
         return "app:gettoken失败 %s" % t.get("errmsg")
-    r = post_json("%s/message/send?access_token=%s" % (QYAPI, t["access_token"]), {
-        "touser": touser, "msgtype": "text", "agentid": agentid,
-        "text": {"content": text}, "safe": 0,
+    send_url = "%s/message/send?access_token=%s" % (QYAPI, t["access_token"])
+    r = post_json(send_url, {
+        "touser": touser, "msgtype": "markdown", "agentid": agentid,
+        "markdown": {"content": content}, "safe": 0,
     })
-    bits = ["errcode=%s" % r.get("errcode"), "errmsg=%s" % (r.get("errmsg") or "-")]
+    downgraded = ""
+    if r.get("errcode") not in (0, None):
+        downgraded = "降级text(%s) " % (r.get("errmsg") or r.get("errcode"))
+        r = post_json(send_url, {
+            "touser": touser, "msgtype": "text", "agentid": agentid,
+            "text": {"content": strip_color(content)}, "safe": 0,
+        })
+    bits = ["%serrcode=%s" % (downgraded, r.get("errcode")),
+            "errmsg=%s" % (r.get("errmsg") or "-")]
     if r.get("invaliduser"):
         bits.append("invaliduser=%s" % r["invaliduser"])
     if r.get("msgid"):
