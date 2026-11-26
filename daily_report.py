@@ -300,7 +300,7 @@ def expiry_block(r, claims, today):
     base = today if isinstance(today, date) else date.fromisoformat(str(today))
     left = (start_day - base).days
     when = "今天" if left <= 0 else "明天" if left == 1 else "%s 天后" % left
-    lines = ["📅 %s，%s 开始，三天内过期 %g 分" % (when, start, round(three))]
+    lines = ["📅 约 %s，%s 开始，三天内约过期 %g 分" % (when, start, round(three))]
     if left <= 0:
         lines.append("⏰ 今天就到期，尽快用掉")
     elif left == 1:
@@ -337,7 +337,7 @@ def build_text(rows, title, claims, run_url=None):
         if r["has_data"] and r["status"] in ("error", "failed", "ineligible") and r["message"]:
             lines.append("❗ 今天没领到：%s" % r["message"][:60])
     lines.append("")
-    lines.append("⚪ 注：套餐按周期整批到期；签到积分每笔 30 天，滚动到期")
+    lines.append("⚪ 注：套餐按周期整批到期；签到积分每笔 30 天滚动到期，逐日数量按账本推算")
     if run_url:
         lines.append("🔗 运行详情：%s" % run_url)
     return fit_text("\n".join(lines))
