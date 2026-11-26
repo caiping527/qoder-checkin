@@ -249,6 +249,66 @@ def expiry_lines(r, claims, today):
     return lines
 
 
+def account_label(name):
+    """播报统一写「尾号 xxxx」；已经是尾号就不重复加。"""
+    text = str(name or "").strip()
+    if text.startswith("尾号"):
+        return text
+    digits = re.sub(r"\D", "", text)
+    if len(digits) >= 4:
+        return "尾号" + digits[-4:]
+    return text or "未命名账号"
+
+
+def expiry_batches(r, claims, today):
+    """把「套餐批次 + 签到积分逐日到期」铺成 [(日期, 分数)]。
+
+    套餐：整批在 expire_date 到期（套餐剩余为 0 时不出现）。
+    签到积分：按 addon_expiry 的推算，最早那天可能不满 100，之后每天 100 直到剩余用完。
+    """
+    batches = []
+    if r["plan_remaining"] > 0 and r["expire_date"]:
+        batches.append({"date": r["expire_date"], "amount": r["plan_remaining"]})
+    est = addon_expiry(r, claims, today)
+    if est and r["addon_remaining"] > 0:
+        start = date.fromisoformat(est["earliest"])
+        left = r["addon_remaining"]
+        first = min(left, est["day_amount"])
+        batches.append({"date": start.isoformat(), "amount": first})
+        left -= first
+        shift = 1
+        while left > 0.01:
+            step = min(LOT_SIZE, left)
+            batches.append({"date": (start + timedelta(days=shift)).isoformat(), "amount": step})
+            left -= step
+            shift += 1
+    return batches
+
+
+def expiry_block(r, claims, today):
+    """手机播报的到期段：几天后开始过期、三天内合计、建议提前一天用掉。"""
+    if not r["has_data"]:
+        return ["⚪ 积分数据未取到"]
+    batches = expiry_batches(r, claims, today)
+    if not batches:
+        return ["📅 暂无到期数据"]
+    start = min(b["date"] for b in batches)
+    start_day = date.fromisoformat(start)
+    three = sum(b["amount"] for b in batches
+                if start_day <= date.fromisoformat(b["date"]) <= start_day + timedelta(days=2))
+    base = today if isinstance(today, date) else date.fromisoformat(str(today))
+    left = (start_day - base).days
+    when = "今天" if left <= 0 else "明天" if left == 1 else "%s 天后" % left
+    lines = ["📅 %s，%s 开始，三天内过期 %g 分" % (when, start, round(three))]
+    if left <= 0:
+        lines.append("⏰ 今天就到期，尽快用掉")
+    elif left == 1:
+        lines.append("⏰ 明天就到期，今天用掉")
+    else:
+        lines.append("⏰ 建议 %s 前用掉（提前一天）" % (start_day - timedelta(days=1)).isoformat())
+    return lines
+
+
 def build_text(rows, title, claims, run_url=None):
     """手机播报：纯文本 + emoji 色标（微信端 markdown/图片都不可靠，只有 emoji 有颜色）。"""
     now = datetime.now(BEIJING)
@@ -265,10 +325,10 @@ def build_text(rows, title, claims, run_url=None):
         len(rows), "，%d 个未取到" % len(bad) if bad else "，全部正常"))
     for r in rows:
         lines.append("")
-        lines.append(("🟩 " if r["has_data"] else "🟥 ") + r["account"])
+        lines.append(("🟩 " if r["has_data"] else "🟥 ") + account_label(r["account"]))
         if r["has_data"]:
             lines.append("💰 当前积分 %g 分" % r["credits"])
-            for part in expiry_lines(r, claims, today):
+            for part in expiry_block(r, claims, today):
                 lines.append(part)
         else:
             reason = (r["message"] or r["error"] or "未知原因")[:60]
