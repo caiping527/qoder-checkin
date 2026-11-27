@@ -141,8 +141,8 @@ def load_rows(root):
             "label": str(exp.get("label") or "开始过期"),
             "error": err,
         })
-    # 与 AiRoute「积分先到期先用」一致：到期日近的在前；同日则套餐临期多的在前；
-    # 再按总积分、账号名稳定排序。
+    # 这里的排序只是兜底（只按套餐到期日）；main() 会用 sort_rows() 按
+    # 「套餐/签到分里真正最早到期那天」重排，签到分哪天到期要读账本才算得出。
     rows.sort(key=lambda r: (r["days_left"] if r["days_left"] is not None else 999,
                              -r["plan_remaining"], -r["credits"], r["account"]))
     return rows
@@ -249,35 +249,79 @@ def expiry_lines(r, claims, today):
     return lines
 
 
-def pick_today(rows, window=7):
+def earliest_start(r, claims, today):
+    """这个号「真正会过期的最早一天」→ (日期, 还有几天)。
+
+    2026-11-27 修：以前排序和推荐句用的是 result.json 里的 days_left /
+    earliest_expire_date，那是**套餐**的到期日。套餐剩余为 0 时那天根本不会
+    再有过期（6717 套餐今天到期但已用光），于是出现「推荐 6717 今天过期」
+    和明细「19 天后 12-16 开始」同屏打架、7100(18 天) 反而排在它后面。
+    现在统一用 expiry_batches 里最早的那天：套餐有剩余才算套餐日，否则看
+    签到分推算——排行、推荐、明细三处同一个口径。
+    """
+    if not r["has_data"]:
+        return "", 999
+    batches = expiry_batches(r, claims, today)
+    if not batches:
+        return "", 999
+    start = min(b["date"] for b in batches)
+    base = today if isinstance(today, date) else date.fromisoformat(str(today))
+    return start, (date.fromisoformat(start) - base).days
+
+
+def three_day_amount(r, claims, today):
+    """最早那天起三天内合计过期多少分（同日排序用：先到期、同天则过期多的先用）。"""
+    batches = expiry_batches(r, claims, today)
+    if not batches:
+        return 0.0
+    start = date.fromisoformat(min(b["date"] for b in batches))
+    return sum(b["amount"] for b in batches
+               if start <= date.fromisoformat(b["date"]) <= start + timedelta(days=2))
+
+
+def sort_rows(rows, claims, today):
+    """按「真正最早到期日」升序；同日先比三天内过期量，再比总积分、账号名。
+
+    必须在读到账本（claims）之后调用——签到分哪天开始到期要按账本推算。
+    """
+    def key(r):
+        _, days = earliest_start(r, claims, today)
+        return (days, -round(three_day_amount(r, claims, today), 2),
+                -r["credits"], r["account"])
+    return sorted(rows, key=key)
+
+
+def pick_today(rows, claims, today, window=7):
     """今天该用哪些号：取「最早到期日」那一组，同一天的都算。
 
     一天的消耗量有限，同一天有多个号到期时要轮着用，只推一个号会漏掉另一个
     （2026-11-27 与小浣熊 / WorkBuddy 播报统一口径）。
     """
-    cand = [r for r in rows
-            if r["has_data"] and isinstance(r["days_left"], (int, float))
-            and r["days_left"] <= window]
+    cand = []
+    for r in rows:
+        start, days = earliest_start(r, claims, today)
+        if start and days <= window:
+            cand.append((days, r))
     if not cand:
         return []
-    first = min(r["days_left"] for r in cand)
-    return [r for r in cand if r["days_left"] == first]
+    first = min(days for days, _ in cand)
+    return [r for days, r in cand if days == first]
 
 
-def today_sentence(rows):
+def today_sentence(rows, claims, today):
     """推荐句：把最早到期那一组号全列出来。
 
     不写金额：Qoder 的签到分是每天滚着到期，最早那天往往只有零头
     （「最早那天 11 分」比「三天内约 211 分」更容易让人误会），
     具体分数在下面每个账号的「三天内约过期」那行看。
     """
-    picked = pick_today(rows)
+    picked = pick_today(rows, claims, today)
     if not picked:
         return "⚪ 近 7 天没有临期积分，不用特意切号"
-    days = picked[0]["days_left"]
+    start, days = earliest_start(picked[0], claims, today)
     when = "今天" if days <= 0 else "明天" if days == 1 else "%s 天后" % days
     names = "、".join(account_label(r["account"]) for r in picked)
-    return "📣 今天优先用 %s —— %s 开始过期（%s）" % (names, picked[0]["expire_date"], when)
+    return "📣 今天优先用 %s —— %s 开始过期（%s）" % (names, start, when)
 
 
 def account_label(name):
@@ -356,7 +400,7 @@ def build_text(rows, title, claims, run_url=None):
     lines.append("📣 收到 %d 个账号的积分数据%s" % (
         len(rows), "，%d 个未取到" % len(bad) if bad else "，全部正常"))
     # 最早到期顶到第一：推荐句先给，下面账号列表也按到期日升序排
-    lines.append(today_sentence(rows))
+    lines.append(today_sentence(rows, claims, today))
     for r in rows:
         lines.append("")
         lines.append(("🟩 " if r["has_data"] else "🟥 ") + account_label(r["account"]))
@@ -482,7 +526,8 @@ def main():
             ledger_path = args[i + 1]
     claims = load_ledger(ledger_path)
     today = datetime.now(BEIJING).date().isoformat()
-    rows = load_rows(root)
+    # 排序要按「真正最早到期日」算，必须等账本读进来（签到分哪天开始到期靠账本推算）
+    rows = sort_rows(load_rows(root), claims, today)
     print(build_report(rows, title, claims, today))
     policy = str(os.environ.get("RECOMMEND_NOTIFY") or "daily").strip().lower()
     if policy in ("0", "off", "false", "no", "none", "disabled"):
