@@ -249,6 +249,37 @@ def expiry_lines(r, claims, today):
     return lines
 
 
+def pick_today(rows, window=7):
+    """今天该用哪些号：取「最早到期日」那一组，同一天的都算。
+
+    一天的消耗量有限，同一天有多个号到期时要轮着用，只推一个号会漏掉另一个
+    （2026-11-27 与小浣熊 / WorkBuddy 播报统一口径）。
+    """
+    cand = [r for r in rows
+            if r["has_data"] and isinstance(r["days_left"], (int, float))
+            and r["days_left"] <= window]
+    if not cand:
+        return []
+    first = min(r["days_left"] for r in cand)
+    return [r for r in cand if r["days_left"] == first]
+
+
+def today_sentence(rows):
+    """推荐句：把最早到期那一组号全列出来。
+
+    不写金额：Qoder 的签到分是每天滚着到期，最早那天往往只有零头
+    （「最早那天 11 分」比「三天内约 211 分」更容易让人误会），
+    具体分数在下面每个账号的「三天内约过期」那行看。
+    """
+    picked = pick_today(rows)
+    if not picked:
+        return "⚪ 近 7 天没有临期积分，不用特意切号"
+    days = picked[0]["days_left"]
+    when = "今天" if days <= 0 else "明天" if days == 1 else "%s 天后" % days
+    names = "、".join(account_label(r["account"]) for r in picked)
+    return "📣 今天优先用 %s —— %s 开始过期（%s）" % (names, picked[0]["expire_date"], when)
+
+
 def account_label(name):
     """播报统一写「尾号 xxxx」；已经是尾号就归一化，不重复加。"""
     text = str(name or "").strip()
@@ -324,6 +355,8 @@ def build_text(rows, title, claims, run_url=None):
     bad = [r for r in rows if not r["has_data"]]
     lines.append("📣 收到 %d 个账号的积分数据%s" % (
         len(rows), "，%d 个未取到" % len(bad) if bad else "，全部正常"))
+    # 最早到期顶到第一：推荐句先给，下面账号列表也按到期日升序排
+    lines.append(today_sentence(rows))
     for r in rows:
         lines.append("")
         lines.append(("🟩 " if r["has_data"] else "🟥 ") + account_label(r["account"]))
@@ -345,7 +378,7 @@ def build_text(rows, title, claims, run_url=None):
 
 def build_report(rows, title, claims, today):
     """Markdown 榜单，写进 Actions Summary（与手机版同口径，只是排版好看点）。"""
-    lines = ["#### %s · 每日积分播报" % title, "",
+    lines = ["#### %s · 每日积分播报（按最早到期日排序）" % title, "",
              "| # | 账号 | 当前积分 | 套餐到期 | 积分约到期 | 签到状态 |",
              "| --- | --- | --- | --- | --- | --- |"]
     for i, r in enumerate(rows, 1):
