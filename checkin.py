@@ -197,7 +197,7 @@ def notify_failure(result):
         "> **原因**：" + str(result.get("message") or "未知原因"),
         ">",
         "> **处理建议**：若为令牌失效，请在 AiRoute「渠道账号」重新登录该 Qoder 账号，",
-        "> 再双击本机「QODER签到更新 / 同步全部账号.bat」",
+        "> 再双击本机「Github-Qoder签到 / Qoder签到.pyw」",
     ]
     content = chr(10).join(lines)
     outcome = notify_wecom(title, content)
